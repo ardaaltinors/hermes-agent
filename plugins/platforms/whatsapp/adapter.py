@@ -1370,10 +1370,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
                                 asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                                await self._dispatch_message_event(event)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1413,6 +1410,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     # ── Text debounce batching ──────────────────────────────────────
 
     _SPLIT_THRESHOLD = 6000  # WhatsApp supports ~65K chars; generous threshold
+
+    @staticmethod
+    def _should_bypass_text_batch(event: MessageEvent) -> bool:
+        """Return True when a text event must dispatch immediately."""
+        if event.message_type != MessageType.TEXT:
+            return False
+        return bool((event.text or "").strip().startswith("/"))
+
+    async def _dispatch_message_event(self, event: MessageEvent) -> None:
+        """Dispatch a bridge event, debouncing only ordinary text."""
+        if event.message_type == MessageType.TEXT:
+            if self._should_bypass_text_batch(event):
+                await self.handle_message(event)
+            else:
+                self._enqueue_text_event(event)
+            return
+        await self.handle_message(event)
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""

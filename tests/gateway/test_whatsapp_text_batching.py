@@ -51,3 +51,43 @@ def test_invalid_config_value_falls_back_to_default():
     assert adapter._text_batch_split_delay_seconds == 10.0
 
 
+def test_slash_command_bypasses_text_batch():
+    adapter = _make_adapter()
+    dispatched = []
+    enqueued = []
+
+    async def _capture(event):
+        dispatched.append(event.text)
+
+    def _capture_enqueue(event):
+        enqueued.append(event.text)
+
+    adapter.handle_message = _capture
+    adapter._enqueue_text_event = _capture_enqueue
+
+    asyncio.run(adapter._dispatch_message_event(_event("/new")))
+
+    assert dispatched == ["/new"]
+    assert enqueued == []
+
+
+def test_ordinary_text_still_uses_text_batch():
+    adapter = _make_adapter()
+    dispatched = []
+    enqueued = []
+
+    async def _capture(event):
+        dispatched.append(event.text)
+
+    def _capture_enqueue(event):
+        enqueued.append(event.text)
+
+    adapter.handle_message = _capture
+    adapter._enqueue_text_event = _capture_enqueue
+
+    asyncio.run(adapter._dispatch_message_event(_event("hello")))
+
+    assert dispatched == []
+    assert enqueued == ["hello"]
+
+
