@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +38,7 @@ def _make_adapter():
     adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
     adapter.config = MagicMock()
-    adapter.config.extra = {}
+    adapter.config.extra = {"group_sessions_per_user": False}
     adapter._bridge_port = 3000
     adapter._bridge_script = "/tmp/test-bridge.js"
     adapter._session_path = MagicMock()
@@ -78,6 +80,31 @@ class _AsyncCM:
 
     async def __aexit__(self, *exc):
         return False
+
+
+def _make_text_event(text: str, *, chat_id: str = "group-1", user_id: str = "u1") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id=chat_id,
+            chat_type="group",
+            user_id=user_id,
+            user_name=user_id,
+        ),
+    )
+
+
+def _init_text_batch_attrs(adapter, *, delay=10.0, split_delay=10.0, hard_cap=0.0, max_messages=0):
+    adapter._text_batch_delay_seconds = delay
+    adapter._text_batch_split_delay_seconds = split_delay
+    adapter._text_batch_hard_cap_seconds = hard_cap
+    adapter._text_batch_max_messages = max_messages
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._pending_text_batch_first_ts = {}
+    adapter._pending_text_batch_counts = {}
 
 
 # ---------------------------------------------------------------------------
@@ -278,4 +305,59 @@ class TestWhatsAppTier:
         from gateway.display_config import resolve_display_setting
         # TIER_MEDIUM has streaming: None (follow global), not False
         assert resolve_display_setting({}, "whatsapp", "streaming") is None
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp incoming text batch debounce tests
+# ---------------------------------------------------------------------------
+
+class TestIncomingTextBatchDebounce:
+    """WhatsApp text batching coalesces rapid group chatter before agent dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_hard_cap_bounds_quiet_timer(self, monkeypatch):
+        adapter = _make_adapter()
+        _init_text_batch_attrs(adapter, delay=25.0, hard_cap=45.0)
+        adapter.handle_message = AsyncMock()
+
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        monkeypatch.setattr("plugins.platforms.whatsapp.adapter.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("plugins.platforms.whatsapp.adapter.time.monotonic", lambda: 100.0)
+
+        adapter._enqueue_text_event(_make_text_event("m1"))
+        key = next(iter(adapter._pending_text_batch_tasks))
+        adapter._pending_text_batch_first_ts[key] = 70.0  # already 30s into burst
+
+        await adapter._pending_text_batch_tasks[key]
+
+        assert sleeps == [15.0]
+        adapter.handle_message.assert_awaited_once()
+        sent_event = adapter.handle_message.await_args.args[0]
+        assert sent_event.text == "m1"
+        assert key not in adapter._pending_text_batches
+        assert key not in adapter._pending_text_batch_first_ts
+        assert key not in adapter._pending_text_batch_counts
+
+    @pytest.mark.asyncio
+    async def test_max_messages_flushes_batch_immediately(self):
+        adapter = _make_adapter()
+        _init_text_batch_attrs(adapter, delay=999.0, hard_cap=999.0, max_messages=2)
+        adapter.handle_message = AsyncMock()
+
+        adapter._enqueue_text_event(_make_text_event("m1", user_id="u1"))
+        adapter._enqueue_text_event(_make_text_event("m2", user_id="u2"))
+
+        key = next(iter(adapter._pending_text_batch_tasks))
+        await adapter._pending_text_batch_tasks[key]
+
+        adapter.handle_message.assert_awaited_once()
+        sent_event = adapter.handle_message.await_args.args[0]
+        assert sent_event.text == "m1\nm2"
+        assert key not in adapter._pending_text_batches
+        assert key not in adapter._pending_text_batch_first_ts
+        assert key not in adapter._pending_text_batch_counts
 

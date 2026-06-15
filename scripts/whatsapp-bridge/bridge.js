@@ -558,10 +558,10 @@ async function startSocket() {
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        if (chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
@@ -579,29 +579,42 @@ async function startSocket() {
           // customer chatId allowlist — without that gate, any contact
           // the owner replied to would leak into Hermes and trigger
           // implicit handover. See `owner_message_gate.js`.
-          const decision = classifyOwnerMessageGate({
-            fromMe: true,
-            fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
-            recentlySent: recentlySentIds,
-            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
-            messageId: msg.key.id,
-            chatId,
-          });
-          if (decision.action === 'drop_echo') continue;
-          if (decision.action === 'drop_disabled') continue;
-          if (decision.action === 'drop_allowlist') {
-            try {
-              console.log(JSON.stringify({
-                event: 'ignored',
-                reason: 'allowlist_mismatch_owner_chat',
-                chatId,
-                senderId,
-              }));
-            } catch {}
+          // Same-number group bots receive owner-typed group messages as
+          // fromMe. Preserve those; Hermes' own replies are filtered later by
+          // recentlySentIds / reply-prefix checks after the body is parsed.
+          if (!isGroup) {
+            const decision = classifyOwnerMessageGate({
+              fromMe: true,
+              fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
+              recentlySent: recentlySentIds,
+              allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+              messageId: msg.key.id,
+              chatId,
+            });
+            if (decision.action === 'drop_echo') continue;
+            if (decision.action === 'drop_disabled') continue;
+            if (decision.action === 'drop_allowlist') {
+              try {
+                console.log(JSON.stringify({
+                  event: 'ignored',
+                  reason: 'allowlist_mismatch_owner_chat',
+                  chatId,
+                  senderId,
+                }));
+              } catch {}
+              continue;
+            }
+            fromOwner = true;
+          }
+        } else {
+          if (isGroup) {
+            emitDebugEvent({
+              stage: 'ignored',
+              reason: 'from_me_group',
+              chatId: redactWhatsAppId(chatId),
+            });
             continue;
           }
-          fromOwner = true;
-        } else {
           // Self-chat mode: only allow messages in the user's own self-chat.
           // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
           // AND classic format: 34652029134@s.whatsapp.net

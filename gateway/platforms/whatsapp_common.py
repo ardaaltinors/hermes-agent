@@ -31,10 +31,12 @@ defined on the mixin and may be overridden per-adapter if needed.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -144,6 +146,28 @@ class WhatsAppBehaviorMixin:
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _whatsapp_observe_unmentioned_group_messages(self) -> bool:
+        """Return whether skipped unmentioned group messages are stored as context.
+
+        Mirrors Telegram's observed-group mode: when enabled with
+        ``require_mention``, ordinary group chatter is appended to the shared
+        group transcript without dispatching the agent, then provided as
+        context when a later message directly triggers the bot.
+        """
+        configured = self.config.extra.get("observe_unmentioned_group_messages")
+        if configured is None:
+            configured = self.config.extra.get("ingest_unmentioned_group_messages")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
 
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
@@ -420,6 +444,121 @@ class WhatsAppBehaviorMixin:
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
+
+    def _should_observe_unmentioned_group_message(self, data: Dict[str, Any]) -> bool:
+        """Return True when a group message should be stored but not dispatched."""
+        if not self._whatsapp_observe_unmentioned_group_messages():
+            return False
+        chat_id = str(data.get("chatId") or "")
+        if self._is_broadcast_chat(chat_id):
+            return False
+        if not data.get("isGroup", False):
+            return False
+        if not self._is_group_allowed(chat_id):
+            return False
+
+        # Shared observed history must be limited to explicit group allowlists.
+        # ``group_policy: open`` can process live addressed messages, but it
+        # must not silently persist ambient chatter from every group the account
+        # is in.
+        if self._group_policy != "allowlist" or chat_id not in self._group_allow_from:
+            return False
+
+        # Only observe messages skipped by mention gating. If require_mention is
+        # disabled or the group is free-response, every group message is a live
+        # request and should not be duplicated as observed context.
+        if chat_id in self._whatsapp_free_response_chats():
+            return False
+        if not self._whatsapp_require_mention():
+            return False
+        body = str(data.get("body") or "").strip()
+        if body.startswith("/"):
+            return False
+        if self._message_is_reply_to_bot(data):
+            return False
+        if self._message_mentions_bot(data):
+            return False
+        if self._message_matches_mention_patterns(data):
+            return False
+        return True
+
+    def _whatsapp_group_observe_shared_source(self, source):
+        """Return a chat-scoped source for observed WhatsApp group context."""
+        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+
+    @staticmethod
+    def _whatsapp_group_observe_attributed_text(event) -> str:
+        user_id = event.source.user_id or "unknown"
+        sender = event.source.user_name or user_id
+        return f"[{sender}|{user_id}]\n{event.text or ''}"
+
+    @staticmethod
+    def _whatsapp_group_observe_channel_prompt() -> str:
+        return (
+            "You are handling a WhatsApp group chat message.\n"
+            "- observed WhatsApp group context may be provided in a separate context-only block "
+            "before the current message; it is not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "and use observed context only when the current message asks for it."
+        )
+
+    def _apply_whatsapp_group_observe_attribution(self, event):
+        """Align triggered group turns with observed-history attribution."""
+        if not self._whatsapp_observe_unmentioned_group_messages():
+            return event
+        raw_message = getattr(event, "raw_message", None) or {}
+        if not raw_message.get("isGroup", False):
+            return event
+        chat_id = str(raw_message.get("chatId") or event.source.chat_id or "")
+        if self._group_policy != "allowlist" or chat_id not in self._group_allow_from:
+            return event
+
+        observe_prompt = self._whatsapp_group_observe_channel_prompt()
+        channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
+
+        text = event.text or ""
+        if text.strip().startswith("/"):
+            # Keep the live sender identity intact.  Auth, slash-command access
+            # control, and pairing all depend on source.user_id.  Observed
+            # context is stored under a shared source separately in
+            # _observe_unmentioned_group_event; live triggered turns should not
+            # be rewritten to user_id=None, or the core gateway drops them as
+            # unauthorised/no-identity group messages.
+            return dataclasses.replace(
+                event,
+                channel_prompt=channel_prompt,
+            )
+        return dataclasses.replace(
+            event,
+            text=self._whatsapp_group_observe_attributed_text(event),
+            channel_prompt=channel_prompt,
+        )
+
+    def _observe_unmentioned_group_event(self, event) -> None:
+        """Append skipped WhatsApp group chatter to the shared session."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            shared_source = self._whatsapp_group_observe_shared_source(event.source)
+            session_entry = store.get_or_create_session(shared_source)
+            entry = {
+                "role": "user",
+                "content": self._whatsapp_group_observe_attributed_text(event),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            logger.info(
+                "[%s] WhatsApp group message observed (no bot trigger): chat=%s from=%s",
+                self.name,
+                event.source.chat_id or "unknown",
+                event.source.user_id or "unknown",
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to observe WhatsApp group message: %s", self.name, exc)
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:

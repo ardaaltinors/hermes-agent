@@ -22,6 +22,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -487,17 +488,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # message triggers a separate agent invocation, wasting tokens and
         # flooding the user with reply fragments.  Default 5s delay /
         # 10s split delay are conservative for WhatsApp's delivery cadence.
+        # ``text_batch_hard_cap_seconds`` bounds active group bursts that keep
+        # resetting the quiet timer forever; ``text_batch_max_messages`` lets a
+        # huge burst flush early instead of growing without bound.
         # Tunable via config.yaml under
         # ``gateway.platforms.whatsapp.extra.text_batch_delay_seconds`` /
-        # ``text_batch_split_delay_seconds``.
+        # ``text_batch_split_delay_seconds`` / ``text_batch_hard_cap_seconds`` /
+        # ``text_batch_max_messages``.
         self._text_batch_delay_seconds = self._coerce_float_extra(
             "text_batch_delay_seconds", 5.0
         )
         self._text_batch_split_delay_seconds = self._coerce_float_extra(
             "text_batch_split_delay_seconds", 10.0
         )
+        self._text_batch_hard_cap_seconds = self._coerce_float_extra(
+            "text_batch_hard_cap_seconds", 0.0
+        )
+        self._text_batch_max_messages = self._coerce_int_extra(
+            "text_batch_max_messages", 0
+        )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_text_batch_first_ts: Dict[str, float] = {}
+        self._pending_text_batch_counts: Dict[str, int] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -516,6 +529,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return float(default)
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
+        return parsed
+
+    def _coerce_int_extra(self, key: str, default: int) -> int:
+        """Read a non-negative int from ``config.extra`` with safe fallback."""
+        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+        if value is None:
+            return int(default)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return int(default)
+        if parsed < 0:
+            return int(default)
         return parsed
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -1383,6 +1409,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
+                            should_process = self._should_process_message(msg_data)
+                            should_observe = self._should_observe_unmentioned_group_message(msg_data)
+                            if not should_process:
+                                if should_observe:
+                                    observed_event = await self._build_message_event(
+                                        msg_data,
+                                        apply_process_gate=False,
+                                    )
+                                    if observed_event:
+                                        self._observe_unmentioned_group_event(observed_event)
+                                continue
+
                             event = await self._build_message_event(msg_data)
                             if event:
                                 # Fire-and-forget: a slow bridge /read must not
@@ -1466,17 +1504,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        now = time.monotonic()
         chunk_len = len(event.text or "")
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
+            self._pending_text_batch_first_ts[key] = now
+            self._pending_text_batch_counts[key] = 1
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            self._pending_text_batch_counts[key] = self._pending_text_batch_counts.get(key, 1) + 1
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+
+        if self._text_batch_max_messages > 0 and self._pending_text_batch_counts.get(key, 0) >= self._text_batch_max_messages:
+            prior_task = self._pending_text_batch_tasks.pop(key, None)
+            if prior_task and not prior_task.done():
+                prior_task.cancel()
+            self._pending_text_batch_tasks[key] = asyncio.create_task(
+                self._flush_text_batch_now(key)
+            )
+            return
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -1495,19 +1546,39 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 delay = self._text_batch_split_delay_seconds
             else:
                 delay = self._text_batch_delay_seconds
+            first_ts = self._pending_text_batch_first_ts.get(key)
+            if first_ts is not None and self._text_batch_hard_cap_seconds > 0:
+                hard_remaining = max(0.0, self._text_batch_hard_cap_seconds - (time.monotonic() - first_ts))
+                delay = min(delay, hard_remaining)
             await asyncio.sleep(delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
-                return
-            await self.handle_message(event)
+            await self._flush_text_batch_now(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[%s] WhatsApp text batch flush failed: key=%s", self.name, key)
+            raise
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
-    async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch and clear one aggregated WhatsApp text batch immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        self._pending_text_batch_first_ts.pop(key, None)
+        self._pending_text_batch_counts.pop(key, None)
+        if not event:
+            return
+        await self.handle_message(event)
+
+    async def _build_message_event(
+        self,
+        data: Dict[str, Any],
+        *,
+        apply_process_gate: bool = True,
+    ) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            if apply_process_gate and not self._should_process_message(data):
                 return None
 
             # Determine message type
@@ -1688,7 +1759,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if not body.startswith(_OWNER_REPLY_PREFIX):
                     body = f"{_OWNER_REPLY_PREFIX}{body}"
 
-            return MessageEvent(
+            event = MessageEvent(
                 text=body,
                 message_type=msg_type,
                 source=source,
@@ -1702,6 +1773,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 reply_to_author_id=reply_to_author_id,
                 reply_to_is_own_message=reply_to_is_own_message,
             )
+            if apply_process_gate:
+                event = self._apply_whatsapp_group_observe_attribution(event)
+            return event
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
             return None
@@ -1910,6 +1984,8 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
     if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
         os.environ["WHATSAPP_MENTION_PATTERNS"] = _json.dumps(whatsapp_cfg["mention_patterns"])
+    if "observe_unmentioned_group_messages" in whatsapp_cfg and not os.getenv("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
+        os.environ["WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(whatsapp_cfg["observe_unmentioned_group_messages"]).lower()
     frc = whatsapp_cfg.get("free_response_chats")
     if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
         if isinstance(frc, list):

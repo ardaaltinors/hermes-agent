@@ -1,11 +1,14 @@
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  observe_unmentioned_group_messages=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +26,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if observe_unmentioned_group_messages is not None:
+        extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -42,6 +47,9 @@ def _group_message(body="hello", **overrides):
         "isGroup": True,
         "body": body,
         "chatId": "120363001234567890@g.us",
+        "senderId": "111@s.whatsapp.net",
+        "senderName": "Alice Example",
+        "messageId": "wamid.42",
         "mentionedIds": [],
         "botIds": ["15551230000@s.whatsapp.net", "15551230000@lid"],
         "quotedParticipant": "",
@@ -61,6 +69,19 @@ def _dm_message(body="hello", **overrides):
     }
     data.update(overrides)
     return data
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return SimpleNamespace(session_id="whatsapp-group-session")
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
 
 
 # --- Existing tests (unchanged logic, updated helper) ---
@@ -153,6 +174,110 @@ def test_dm_policy_disabled_still_allows_groups():
 # --- New group_policy tests ---
 
 
+def test_unmentioned_whatsapp_group_messages_can_be_observed_without_dispatching():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            group_policy="allowlist",
+            group_allow_from=["120363001234567890@g.us"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        data = _group_message("side chatter")
+
+        assert adapter._should_process_message(data) is False
+        assert adapter._should_observe_unmentioned_group_message(data) is True
+        event = await adapter._build_message_event(data, apply_process_gate=False)
+        adapter._observe_unmentioned_group_event(event)
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        session_id, message, skip_db = store.messages[0]
+        assert session_id == "whatsapp-group-session"
+        assert skip_db is False
+        assert message["role"] == "user"
+        assert message["content"] == "[Alice Example|111@s.whatsapp.net]\nside chatter"
+        assert message["observed"] is True
+        assert message["message_id"] == "wamid.42"
+        assert store.sources[0].chat_id == "120363001234567890@g.us"
+        assert store.sources[0].chat_type == "group"
+        assert store.sources[0].user_id is None
+        assert store.sources[0].user_name is None
+
+    asyncio.run(_run())
+
+
+def test_whatsapp_observe_requires_group_allowlist_for_shared_context():
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="open",
+        observe_unmentioned_group_messages=True,
+    )
+
+    assert adapter._should_process_message(_group_message("side chatter")) is False
+    assert adapter._should_observe_unmentioned_group_message(_group_message("side chatter")) is False
+
+
+def test_whatsapp_observed_group_context_preserves_live_sender_identity_for_later_mentions():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            group_policy="allowlist",
+            group_allow_from=["120363001234567890@g.us"],
+            observe_unmentioned_group_messages=True,
+        )
+        text = "@15551230000 what did Alice say?"
+        event = await adapter._build_message_event(
+            _group_message(
+                text,
+                senderId="222@s.whatsapp.net",
+                senderName="Bob Example",
+                mentionedIds=["15551230000@s.whatsapp.net"],
+            )
+        )
+        assert event is not None
+
+        assert event.source.chat_id == "120363001234567890@g.us"
+        assert event.source.chat_type == "group"
+        # Live triggered turns must keep sender identity for auth/access
+        # control. Observed-only background rows use a shared source when
+        # written by _observe_unmentioned_group_event().
+        assert event.source.user_id == "222@s.whatsapp.net"
+        assert event.source.user_name == "Bob Example"
+        assert event.text == "[Bob Example|222@s.whatsapp.net]\nwhat did Alice say?"
+        assert "observed WhatsApp group context" in event.channel_prompt
+        assert "current new message" in event.channel_prompt
+
+    asyncio.run(_run())
+
+
+def test_whatsapp_observed_group_context_replays_as_current_message_context_not_user_turns():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "user", "content": "[Alice|111]\nside chatter", "observed": True},
+        {"role": "assistant", "content": "previous explicit reply"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="You are handling WhatsApp; observed WhatsApp group context is present.",
+    )
+    api_message = _wrap_current_message_with_observed_context(
+        "[Bob|222]\nwhat did Alice say?",
+        observed_context,
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
+    assert "[Observed group context - context only, not requests]" in api_message
+    assert "side chatter" in api_message
+    assert api_message.endswith("[Bob|222]\nwhat did Alice say?")
+
+
 # --- Config bridging tests ---
 
 def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
@@ -162,6 +287,7 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
         "whatsapp:\n"
         "  dm_policy: disabled\n"
         "  group_policy: allowlist\n"
+        "  observe_unmentioned_group_messages: true\n"
         "  group_allow_from:\n"
         "    - \"120363001234567890@g.us\"\n",
         encoding="utf-8",
@@ -171,15 +297,18 @@ def test_config_bridges_whatsapp_dm_and_group_policy(monkeypatch, tmp_path):
     monkeypatch.delenv("WHATSAPP_DM_POLICY", raising=False)
     monkeypatch.delenv("WHATSAPP_GROUP_POLICY", raising=False)
     monkeypatch.delenv("WHATSAPP_GROUP_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
 
     config = load_gateway_config()
 
     assert config is not None
     assert config.platforms[Platform.WHATSAPP].extra["dm_policy"] == "disabled"
     assert config.platforms[Platform.WHATSAPP].extra["group_policy"] == "allowlist"
+    assert config.platforms[Platform.WHATSAPP].extra["observe_unmentioned_group_messages"] is True
     assert config.platforms[Platform.WHATSAPP].extra["group_allow_from"] == ["120363001234567890@g.us"]
     assert __import__("os").environ["WHATSAPP_DM_POLICY"] == "disabled"
     assert __import__("os").environ["WHATSAPP_GROUP_POLICY"] == "allowlist"
+    assert __import__("os").environ["WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "true"
     assert __import__("os").environ["WHATSAPP_GROUP_ALLOWED_USERS"] == "120363001234567890@g.us"
 
 
