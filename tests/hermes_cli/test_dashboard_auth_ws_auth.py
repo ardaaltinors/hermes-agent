@@ -354,6 +354,36 @@ class TestWsHostOriginGuardOrigins:
         return ws
 
 
+    def test_loopback_declared_public_url_origin_allowed(self, loopback_app, monkeypatch):
+        """Reverse-proxied self-hosted dashboards can declare their public URL.
+
+        The proxy may connect to the loopback backend with ``Host: 127.0.0.1``
+        while the browser WebSocket upgrade carries
+        ``Origin: https://hermes.example.com``.  When the operator explicitly
+        configured that public URL, the Origin guard should accept it without
+        falling back to broad ``--insecure`` exposure.
+        """
+        from hermes_cli.dashboard_auth import prefix
+
+        monkeypatch.setattr(
+            prefix,
+            "resolve_public_url",
+            lambda: "https://hermes.example.com",
+        )
+        ws = self._ws(origin="https://hermes.example.com", host="127.0.0.1:8080")
+        assert web_server._ws_host_origin_is_allowed(ws) is True
+
+    def test_loopback_other_public_origin_still_rejected(self, loopback_app, monkeypatch):
+        from hermes_cli.dashboard_auth import prefix
+
+        monkeypatch.setattr(
+            prefix,
+            "resolve_public_url",
+            lambda: "https://hermes.example.com",
+        )
+        ws = self._ws(origin="https://evil.test", host="127.0.0.1:8080")
+        assert web_server._ws_host_origin_is_allowed(ws) is False
+
     def test_explicit_non_loopback_file_origin_allowed(self, insecure_explicit_host_app):
         """Packaged Hermes Desktop also uses file:// when connecting to a
         Tailscale/LAN dashboard bind.

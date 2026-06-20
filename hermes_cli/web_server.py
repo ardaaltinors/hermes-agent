@@ -14575,6 +14575,39 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     return client_host in _LOOPBACK_HOSTS
 
 
+def _ws_origin_matches_declared_public_url(parsed_origin: urllib.parse.ParseResult) -> bool:
+    """Return True when Origin matches operator-declared dashboard.public_url.
+
+    A common self-hosted layout keeps the dashboard bound to loopback
+    (``127.0.0.1:9119``) and exposes it through a local reverse proxy at a
+    public HTTPS origin (for example ``https://hermes.example.com``). HTTP
+    requests pass because the proxy talks to loopback with a loopback Host
+    header, but browser WebSocket upgrades carry the *page* Origin, so the
+    loopback-only Origin guard would otherwise reject PTY/chat sockets with
+    ``origin_mismatch``. Treat ``dashboard.public_url`` /
+    ``HERMES_DASHBOARD_PUBLIC_URL`` as the operator's explicit allow-list for
+    that public origin.
+    """
+    if parsed_origin.scheme not in {"http", "https"} or not parsed_origin.netloc:
+        return False
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+    except Exception:
+        return False
+    if not public_url:
+        return False
+    try:
+        parsed_public = urllib.parse.urlparse(public_url)
+    except ValueError:
+        return False
+    return (
+        parsed_origin.scheme == parsed_public.scheme
+        and parsed_origin.netloc.lower() == parsed_public.netloc.lower()
+    )
+
+
 def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     """Return a Host/Origin rejection reason, or None when allowed.
 
@@ -14605,6 +14638,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
     if not _is_accepted_host(parsed.netloc, bound_host):
+        if _ws_origin_matches_declared_public_url(parsed):
+            return None
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
