@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.whatsapp import WhatsAppAdapter
+from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
 
 class _AsyncCM:
