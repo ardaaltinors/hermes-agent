@@ -57,7 +57,7 @@ vi.mock('@/hermes', () => ({
   revealEnvVar: (key: string) => revealEnvVar(key),
   runToolsetPostSetup: (name: string, key: string) => runToolsetPostSetup(name, key),
   getActionStatus: (name: string, lines?: number) => getActionStatus(name, lines),
-  startOAuthLogin: (providerId: string) => startOAuthLogin(providerId),
+  startOAuthLogin: (providerId: string, activateProvider?: boolean) => startOAuthLogin(providerId, activateProvider),
   pollOAuthSession: (providerId: string, sessionId: string) => pollOAuthSession(providerId, sessionId),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   getHermesConfigSchema: () => getHermesConfigSchema(),
@@ -889,7 +889,7 @@ describe('ToolsetConfigPanel', () => {
         getToolsetConfig.mockClear()
         warning!.action!.onClick()
 
-        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('nous'))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('nous', true))
         expect(openSpy).toHaveBeenCalledWith(
           'https://portal.nousresearch.com/device?user_code=NOUS-1234',
           '_blank',
@@ -971,7 +971,7 @@ describe('ToolsetConfigPanel', () => {
         await screen.findByRole('button', { name: /OpenAI Codex OAuth/ })
         fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
-        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex'))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex', false))
         expect(selectToolsetProvider).not.toHaveBeenCalled()
         await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'codex-session'), {
           timeout: 8000

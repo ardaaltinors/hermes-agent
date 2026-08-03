@@ -171,6 +171,31 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_codex_dashboard_start_forwards_credential_only_intent(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    async def fake_start(provider_id, profile=None, *, activate_provider=True):
+        captured.update(
+            provider_id=provider_id,
+            profile=profile,
+            activate_provider=activate_provider,
+        )
+        return {"session_id": "sid", "flow": "device_code"}
+
+    monkeypatch.setattr(ws, "_start_device_code_flow", fake_start)
+    resp = client.post(
+        "/api/providers/oauth/openai-codex/start?activate_provider=false",
+        headers=HEADERS,
+    )
+
+    assert resp.status_code == 200
+    assert captured == {
+        "provider_id": "openai-codex",
+        "profile": None,
+        "activate_provider": False,
+    }
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
@@ -273,7 +298,7 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
     saved = []
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(httpx, "Client", _Client)
-    monkeypatch.setattr(auth_mod, "_save_codex_tokens", lambda tokens: saved.append(tokens))
+    monkeypatch.setattr(auth_mod, "_save_codex_tokens", lambda tokens, **kwargs: saved.append(tokens))
 
     sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
 
@@ -354,7 +379,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_started = threading.Event()
     delete_finished = threading.Event()
 
-    def fake_save(tokens):
+    def fake_save(tokens, **kwargs):
         # We are inside the worker's critical section right now (holding
         # _oauth_sessions_lock). Fire a real DELETE from another thread and
         # prove it cannot complete until this section releases the lock.
@@ -365,7 +390,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         delete_thread.start()
         delete_started.wait(timeout=2)
         still_blocked = not delete_finished.wait(timeout=0.2)
-        saved.append((tokens, still_blocked))
+        saved.append((tokens, still_blocked, kwargs))
 
     def _fire_delete():
         delete_started.set()
@@ -375,7 +400,8 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     monkeypatch.setattr(auth_mod, "_save_codex_tokens", fake_save)
     monkeypatch.setattr(ws.time, "sleep", lambda *_a, **_k: None)
 
-    sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
+    sid, sess = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
+    sess["activate_provider"] = False
 
     ws._codex_full_login_worker(sid)
 
@@ -384,8 +410,9 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_threads[0].join(timeout=2)
 
     assert len(saved) == 1
-    tokens, delete_was_still_blocked_during_save = saved[0]
+    tokens, delete_was_still_blocked_during_save, save_kwargs = saved[0]
     assert tokens == {"access_token": "at", "refresh_token": "rt"}
+    assert save_kwargs == {"set_active": False}
     assert delete_was_still_blocked_during_save, (
         "DELETE must block until the worker's check+save critical section "
         "finishes, not slip in between the check and the save"

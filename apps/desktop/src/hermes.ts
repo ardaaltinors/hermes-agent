@@ -867,10 +867,10 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
-export function startOAuthLogin(providerId: string): Promise<OAuthStartResponse> {
+export function startOAuthLogin(providerId: string, activateProvider = true): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
     ...profileScoped(),
-    path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
+    path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start?activate_provider=${activateProvider}`,
     method: 'POST',
     body: {}
   })

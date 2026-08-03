@@ -624,7 +624,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // refetch the toolset config so is_active / status flip once entitled.
   async function signInToOAuthProvider(providerId: string): Promise<boolean> {
     try {
-      const start = await startOAuthLogin(providerId)
+      const start = await startOAuthLogin(providerId, providerId !== 'openai-codex')
 
       if (start.flow !== 'device_code') {
         notifyError(new Error(`unexpected flow: ${start.flow}`), copy.failedSelect(providerId))

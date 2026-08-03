@@ -10288,6 +10288,8 @@ def _submit_anthropic_pkce(
 async def _start_device_code_flow(
     provider_id: str,
     profile: Optional[str] = None,
+    *,
+    activate_provider: bool = True,
 ) -> Dict[str, Any]:
     """Initiate a device-code flow (Nous, OpenAI Codex, MiniMax, or xAI).
 
@@ -10349,7 +10351,8 @@ async def _start_device_code_flow(
 
     if provider_id == "openai-codex":
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
-        sid, _ = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sid, sess = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sess["activate_provider"] = activate_provider
         # Use the helper but in a thread because it polls inline.
         # We can't extract just the start step without refactoring auth.py,
         # so we run the full helper in a worker and proxy the user_code +
@@ -10892,10 +10895,13 @@ def _codex_full_login_worker(session_id: str) -> None:
                 _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
                 return
             with _profile_scope(session_profile):
-                _save_codex_tokens({
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                })
+                _save_codex_tokens(
+                    {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                    },
+                    set_active=bool(sess.get("activate_provider", True)),
+                )
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
@@ -10912,6 +10918,7 @@ async def start_oauth_login(
     provider_id: str,
     request: Request,
     profile: Optional[str] = None,
+    activate_provider: bool = True,
 ):
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
@@ -10936,7 +10943,11 @@ async def start_oauth_login(
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
             return _start_anthropic_pkce(profile=profile)
         if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile=profile)
+            return await _start_device_code_flow(
+                provider_id,
+                profile=profile,
+                activate_provider=activate_provider,
+            )
     except HTTPException:
         raise
     except Exception as e:
