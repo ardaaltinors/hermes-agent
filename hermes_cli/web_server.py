@@ -10375,6 +10375,8 @@ async def _start_device_code_flow(
         if s.get("status") == "error":
             raise HTTPException(status_code=500, detail=s.get("error_message") or "device-auth failed")
         if not s.get("user_code"):
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
             raise HTTPException(status_code=504, detail="device-auth timed out before returning a user code")
         return {
             "session_id": sid,
@@ -10880,7 +10882,7 @@ def _codex_full_login_worker(session_id: str) -> None:
         if not access_token:
             raise RuntimeError("token exchange did not return access_token")
 
-        from hermes_cli.auth import _save_codex_tokens
+        from hermes_cli.auth import _save_codex_device_login_tokens
 
         # The cancellation check and the save must be one atomic critical
         # section under the same lock cancel_oauth_session() uses. Checking
@@ -10891,18 +10893,19 @@ def _codex_full_login_worker(session_id: str) -> None:
         # either lands before this section (worker observes cancelled and
         # returns) or blocks until this section (and the save) is done.
         with _oauth_sessions_lock:
-            if sess.get("cancelled"):
+            current = _oauth_sessions.get(session_id)
+            if current is None or current.get("cancelled"):
                 _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
                 return
             with _profile_scope(session_profile):
-                _save_codex_tokens(
+                _save_codex_device_login_tokens(
                     {
                         "access_token": access_token,
                         "refresh_token": refresh_token,
                     },
-                    set_active=bool(sess.get("activate_provider", True)),
+                    set_active=bool(current.get("activate_provider", True)),
                 )
-            sess["status"] = "approved"
+            current["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)

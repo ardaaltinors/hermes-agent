@@ -7726,12 +7726,23 @@ def login_openai_codex_credentials_only() -> bool:
         return True
 
     creds = _codex_device_code_login()
-    _save_codex_tokens(
+    _save_codex_device_login_tokens(
         creds["tokens"],
         creds.get("last_refresh"),
         set_active=False,
     )
     return has_codex_runtime_credentials()
+
+
+def _save_codex_device_login_tokens(
+    tokens: Dict[str, Any],
+    last_refresh: Optional[str] = None,
+    *,
+    set_active: bool = True,
+) -> None:
+    """Persist an explicitly authorized device login and restore its source."""
+    unsuppress_credential_source("openai-codex", "device_code")
+    _save_codex_tokens(tokens, last_refresh, set_active=set_active)
 
 
 def _login_openai_codex(
@@ -7781,7 +7792,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_device_login_tokens(cli_tokens)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -7799,7 +7810,7 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_device_login_tokens(creds["tokens"], creds.get("last_refresh"))
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")

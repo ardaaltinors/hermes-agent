@@ -164,7 +164,7 @@ def test_codex_retry_rotates_pool_credential_after_rate_limit():
 
     next_entry = SimpleNamespace(runtime_api_key="next-token", id="cred-2")
     pool = Mock()
-    pool.mark_exhausted_and_rotate.return_value = next_entry
+    pool.select.return_value = next_entry
     with (
         patch("agent.credential_pool.load_pool", return_value=pool),
         patch(
@@ -178,12 +178,8 @@ def test_codex_retry_rotates_pool_credential_after_rate_limit():
 
     assert credentials is not None
     assert credentials["api_key"] == "next-token"
-    pool.try_refresh_matching.assert_not_called()
-    pool.mark_exhausted_and_rotate.assert_called_once_with(
-        status_code=429,
-        api_key_hint="limited-token",
-        credential_id="cred-1",
-    )
+    pool.select.assert_called_once_with()
+    pool.mark_exhausted_and_rotate.assert_not_called()
 
 
 def test_openai_codex_transcription_rotates_once_after_rate_limit(tmp_path):
@@ -243,6 +239,35 @@ def test_openai_codex_second_unauthorized_is_terminal(tmp_path):
     mark_failed.assert_called_once_with(
         {"api_key": "new-token", "credential_id": "new"}, 401
     )
+
+
+def test_openai_codex_second_rate_limit_does_not_exhaust_shared_pool(tmp_path):
+    from tools.transcription_tools import _transcribe_openai_codex
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"audio")
+    with (
+        patch(
+            "tools.transcription_tools._resolve_codex_stt_credentials",
+            return_value={"api_key": "old-token", "credential_id": "old"},
+        ),
+        patch(
+            "tools.transcription_tools._retry_codex_stt_credentials",
+            return_value={"api_key": "new-token", "credential_id": "new"},
+        ),
+        patch(
+            "tools.transcription_tools._mark_codex_stt_credentials_failed"
+        ) as mark_failed,
+        patch(
+            "requests.post",
+            side_effect=[_Response(status_code=429), _Response(status_code=429)],
+        ) as post,
+    ):
+        result = _transcribe_openai_codex(str(audio))
+
+    assert result["error"].endswith("HTTP 429.")
+    assert len(post.call_args_list) == 2
+    mark_failed.assert_not_called()
 
 
 def test_openai_codex_missing_credentials_returns_safe_error(tmp_path):

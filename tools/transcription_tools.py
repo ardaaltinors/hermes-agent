@@ -235,7 +235,7 @@ def _resolve_codex_stt_credentials() -> Dict[str, Any]:
 def _retry_codex_stt_credentials(
     credentials: Dict[str, Any], status_code: int
 ) -> Optional[Dict[str, Any]]:
-    """Refresh or rotate once after a credential-scoped Codex HTTP failure."""
+    """Refresh/rotate once without globally exhausting STT-only throttles."""
     from agent.credential_pool import load_pool
 
     pool = load_pool("openai-codex")
@@ -249,12 +249,16 @@ def _retry_codex_stt_credentials(
         )
         if refreshed is not None and refreshed.runtime_api_key != failed_token:
             return _codex_stt_credentials_from_pool_entry(refreshed)
-
-    next_entry = pool.mark_exhausted_and_rotate(
-        status_code=status_code,
-        api_key_hint=failed_token or None,
-        credential_id=credential_id,
-    )
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=status_code,
+            api_key_hint=failed_token or None,
+            credential_id=credential_id,
+        )
+    else:
+        # A transcribe-endpoint 429 may be feature-local rather than an
+        # account-wide Codex quota. Rotate for this bounded request only; do
+        # not persist shared inference-pool exhaustion.
+        next_entry = pool.select()
     if next_entry is None or next_entry.runtime_api_key == failed_token:
         return None
     return _codex_stt_credentials_from_pool_entry(next_entry)
@@ -2155,7 +2159,7 @@ def _transcribe_openai_codex(
             if retry_credentials is not None:
                 credentials = retry_credentials
                 response = _request(credentials)
-                if response.status_code in {401, 429}:
+                if response.status_code == 401:
                     _mark_codex_stt_credentials_failed(
                         credentials, response.status_code
                     )

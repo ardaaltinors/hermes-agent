@@ -2,6 +2,7 @@
 
 import base64
 import json
+import time
 from unittest.mock import Mock, patch
 
 from hermes_cli.auth import (
@@ -65,7 +66,7 @@ def test_codex_credentials_only_login_does_not_activate_model_provider():
             "hermes_cli.auth._codex_device_code_login",
             return_value=credentials,
         ),
-        patch("hermes_cli.auth._save_codex_tokens") as save_tokens,
+        patch("hermes_cli.auth._save_codex_device_login_tokens") as save_tokens,
         patch("hermes_cli.auth._update_config_for_provider") as update_model,
     ):
         assert login_openai_codex_credentials_only() is True
@@ -74,3 +75,46 @@ def test_codex_credentials_only_login_does_not_activate_model_provider():
         credentials["tokens"], "now", set_active=False
     )
     update_model.assert_not_called()
+
+
+def test_codex_credentials_only_relogin_restores_suppressed_device_source(
+    tmp_path, monkeypatch
+):
+    token = _jwt(
+        {
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-123"
+            },
+        }
+    )
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "active_provider": "anthropic",
+                "providers": {"anthropic": {"api_key": "anthropic-key"}},
+                "suppressed_sources": {"openai-codex": ["device_code"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model:\n  provider: anthropic\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {"access_token": token, "refresh_token": "refresh-token"},
+            "last_refresh": "now",
+        },
+    )
+
+    assert login_openai_codex_credentials_only() is True
+
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert saved["active_provider"] == "anthropic"
+    assert "device_code" not in saved.get("suppressed_sources", {}).get(
+        "openai-codex", []
+    )
+    assert config_path.read_text(encoding="utf-8") == "model:\n  provider: anthropic\n"
