@@ -108,8 +108,16 @@ ELEVENLABS_API_KEY=***           # ElevenLabs — premium quality
 If `faster-whisper` is installed, voice mode works with **zero API keys** for STT. The model (~150 MB for `base`) downloads automatically on first use.
 :::
 
-To use transcription included with a ChatGPT/Codex subscription, first sign
-in to OpenAI Codex as a Hermes model provider, then configure:
+To use transcription included with a ChatGPT/Codex subscription, select
+**OpenAI Codex OAuth** under Speech-to-Text in `hermes tools`. The picker runs a
+credential-only login and does not change the model provider used for chat. You
+can also authenticate separately before opening the picker:
+
+```bash
+hermes auth add openai-codex
+```
+
+For manual configuration, use:
 
 ```yaml
 stt:

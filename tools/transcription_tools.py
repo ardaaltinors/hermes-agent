@@ -276,11 +276,9 @@ def _mark_codex_stt_credentials_failed(
 
 
 def _has_codex_stt_backend() -> bool:
-    try:
-        creds = _resolve_codex_stt_credentials()
-    except Exception:
-        return False
-    return bool(str(creds.get("api_key") or "").strip())
+    from hermes_cli.auth import has_codex_runtime_credentials
+
+    return has_codex_runtime_credentials()
 
 
 def _find_binary(binary_name: str) -> Optional[str]:
@@ -2141,6 +2139,7 @@ def _transcribe_openai_codex(
                 files={"file": (Path(file_path).name, audio_file, mime_type)},
                 data=form_data,
                 timeout=timeout,
+                allow_redirects=False,
             )
 
     try:
@@ -2160,6 +2159,13 @@ def _transcribe_openai_codex(
                     _mark_codex_stt_credentials_failed(
                         credentials, response.status_code
                     )
+
+        if 300 <= response.status_code < 400:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Codex OAuth transcription refused an unexpected redirect.",
+            }
 
         if (
             response.status_code == 403
@@ -2186,13 +2192,14 @@ def _transcribe_openai_codex(
                 "transcript": "",
                 "error": "Codex OAuth transcription returned an invalid response.",
             }
-        transcript = str(payload.get("text") or "").strip()
-        if not transcript:
+        transcript_value = payload.get("text")
+        if not isinstance(transcript_value, str) or not transcript_value.strip():
             return {
                 "success": False,
                 "transcript": "",
                 "error": "Codex OAuth transcription returned no text.",
             }
+        transcript = transcript_value.strip()
 
         logger.info(
             "Transcribed %s via Codex OAuth (lang=%s, %d chars)",

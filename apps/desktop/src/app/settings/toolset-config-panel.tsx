@@ -574,6 +574,14 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
     setSelecting(provider.name)
 
     try {
+      if (provider.auth_provider && providerStatus(provider, envState) === 'needs_auth') {
+        const authenticated = await signInToOAuthProvider(provider.auth_provider)
+
+        if (!authenticated) {
+          return
+        }
+      }
+
       const result = await selectToolsetProvider(toolset, provider.name)
       // Mirror the backend write locally so dependent UI (model catalog
       // enablement) tracks the new active backend without a refetch.
@@ -596,7 +604,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
           kind: 'warning',
           title: copy.nousAuthNeededTitle,
           message: copy.nousAuthNeededMessage(provider.name),
-          action: { label: copy.nousAuthSignIn, onClick: () => void signInToNousPortal() }
+          action: { label: copy.nousAuthSignIn, onClick: () => void signInToOAuthProvider('nous') }
         })
 
         return
@@ -614,14 +622,14 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // Drive the existing Nous Portal OAuth device-code flow (the same session
   // machinery onboarding uses: start → open verification URL → poll), then
   // refetch the toolset config so is_active / status flip once entitled.
-  async function signInToNousPortal() {
+  async function signInToOAuthProvider(providerId: string): Promise<boolean> {
     try {
-      const start = await startOAuthLogin('nous')
+      const start = await startOAuthLogin(providerId)
 
       if (start.flow !== 'device_code') {
-        notifyError(new Error(`unexpected flow: ${start.flow}`), copy.nousAuthFailed)
+        notifyError(new Error(`unexpected flow: ${start.flow}`), copy.failedSelect(providerId))
 
-        return
+        return false
       }
 
       const url = start.verification_url
@@ -641,30 +649,35 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         await new Promise(resolve => window.setTimeout(resolve, 5000))
 
         if (!mountedRef.current) {
-          return
+          return false
         }
 
-        const polled = await pollOAuthSession('nous', start.session_id)
+        const polled = await pollOAuthSession(providerId, start.session_id)
 
         if (polled.status === 'approved') {
-          notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
+          if (providerId === 'nous') {
+            notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
+          }
+
           await refresh()
           onConfiguredChange?.()
 
-          return
+          return true
         }
 
         if (polled.status !== 'pending') {
-          notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.nousAuthFailed)
+          notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.failedSelect(providerId))
 
-          return
+          return false
         }
       }
     } catch (err) {
       if (mountedRef.current) {
-        notifyError(err, copy.nousAuthFailed)
+        notifyError(err, copy.failedSelect(providerId))
       }
     }
+
+    return false
   }
 
   function patchEnv(key: string, isSet: boolean) {

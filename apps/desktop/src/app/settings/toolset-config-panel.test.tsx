@@ -924,6 +924,67 @@ describe('ToolsetConfigPanel', () => {
     })
   })
 
+  describe('Codex STT OAuth activation', () => {
+    it('authenticates before persisting the STT provider selection', async () => {
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      startOAuthLogin.mockResolvedValue({
+        flow: 'device_code',
+        session_id: 'codex-session',
+        user_code: 'CODEX-1234',
+        verification_url: 'https://auth.openai.com/device',
+        poll_interval: 5,
+        expires_in: 600
+      })
+      pollOAuthSession.mockResolvedValue({
+        session_id: 'codex-session',
+        status: 'approved'
+      })
+      selectToolsetProvider.mockResolvedValue({
+        ok: true,
+        name: 'stt',
+        provider: 'OpenAI Codex OAuth'
+      })
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+      try {
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+        render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="stt" />)
+
+        await screen.findByRole('button', { name: /OpenAI Codex OAuth/ })
+        fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex'))
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+        await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'codex-session'), {
+          timeout: 8000
+        })
+        await waitFor(() => expect(selectToolsetProvider).toHaveBeenCalledWith('stt', 'OpenAI Codex OAuth'), {
+          timeout: 8000
+        })
+      } finally {
+        openSpy.mockRestore()
+      }
+    }, 20000)
+  })
+
   describe('API key deep link', () => {
     it('offers "Manage in API Keys" on a set key and navigates to Settings → Keys', async () => {
       getToolsetConfig.mockResolvedValue(

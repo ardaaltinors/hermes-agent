@@ -30,11 +30,20 @@ class _Response:
 def test_explicit_openai_codex_provider_uses_existing_oauth_login():
     from tools.transcription_tools import _get_provider
 
-    with patch(
-        "tools.transcription_tools._resolve_codex_stt_credentials",
-        return_value={"api_key": "oauth-token"},
+    resolver = Mock()
+    with (
+        patch(
+            "hermes_cli.auth.has_codex_runtime_credentials",
+            return_value=True,
+        ),
+        patch(
+            "tools.transcription_tools._resolve_codex_stt_credentials",
+            resolver,
+        ),
     ):
         assert _get_provider({"provider": "openai-codex"}) == "openai-codex"
+
+    resolver.assert_not_called()
 
 
 def test_codex_credentials_include_optional_chatgpt_account_id():
@@ -84,6 +93,7 @@ def test_openai_codex_transcription_uses_subscription_endpoint(tmp_path):
     assert kwargs["headers"]["ChatGPT-Account-Id"] == "account-123"
     assert kwargs["headers"]["User-Agent"].startswith("codex-cli")
     assert kwargs["data"] == {"language": "tr"}
+    assert kwargs["allow_redirects"] is False
     filename, handle, mime = kwargs["files"]["file"]
     assert filename == "voice.webm"
     assert mime == "audio/webm"
@@ -249,6 +259,30 @@ def test_openai_codex_missing_credentials_returns_safe_error(tmp_path):
     assert result["error"] == "OpenAI Codex OAuth credentials are unavailable."
 
 
+def test_openai_codex_refuses_redirects_without_replaying_audio(tmp_path):
+    from tools.transcription_tools import _transcribe_openai_codex
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"audio")
+    response = _Response(
+        status_code=307,
+        payload={"text": "must not be accepted"},
+        headers={"location": "https://attacker.invalid/upload"},
+    )
+    with (
+        patch(
+            "tools.transcription_tools._resolve_codex_stt_credentials",
+            return_value={"api_key": "secret-token", "account_id": "account-1"},
+        ),
+        patch("requests.post", return_value=response) as post,
+    ):
+        result = _transcribe_openai_codex(str(audio))
+
+    assert result["error"].endswith("refused an unexpected redirect.")
+    assert post.call_args.kwargs["allow_redirects"] is False
+    assert len(post.call_args_list) == 1
+
+
 def test_openai_codex_cloudflare_challenge_has_specific_error(tmp_path):
     from tools.transcription_tools import _transcribe_openai_codex
 
@@ -318,6 +352,7 @@ def test_openai_codex_timeout_returns_specific_error(tmp_path):
     [
         (["not", "an", "object"], "invalid response"),
         ({}, "returned no text"),
+        ({"text": ["not", "a", "string"]}, "returned no text"),
     ],
 )
 def test_openai_codex_rejects_malformed_success_payload(tmp_path, payload, error):

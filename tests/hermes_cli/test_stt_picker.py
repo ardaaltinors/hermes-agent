@@ -23,6 +23,7 @@ from hermes_cli.tools_config import (  # noqa: E402
     _configure_provider,
     _configure_stt_model,
     _is_provider_active,
+    _reconfigure_provider,
     _write_provider_config,
     apply_provider_selection,
     provider_readiness_status,
@@ -125,8 +126,10 @@ class TestPostSetup:
 
         assert "faster_whisper" in _POST_SETUP_READY
 
-    def test_codex_row_declares_auth_post_setup(self):
-        assert _stt_provider_named("OpenAI Codex OAuth")["post_setup"] == "openai_codex"
+    def test_codex_row_declares_oauth_provider(self):
+        provider = _stt_provider_named("OpenAI Codex OAuth")
+        assert provider["auth_provider"] == "openai-codex"
+        assert "post_setup" not in provider
 
     @pytest.mark.parametrize(
         ("credentials_present", "expected"),
@@ -173,4 +176,17 @@ class TestPostSetup:
             )
 
         assert config["stt"]["provider"] == "openai-codex"
+        post_setup.assert_not_called()
+
+    def test_failed_codex_login_does_not_reconfigure_provider(self, monkeypatch):
+        from hermes_cli import auth
+
+        monkeypatch.setattr(auth, "has_codex_runtime_credentials", lambda: False)
+        config = {"stt": {"provider": "local"}}
+        with patch("hermes_cli.tools_config._run_post_setup") as post_setup:
+            _reconfigure_provider(
+                _stt_provider_named("OpenAI Codex OAuth"), config
+            )
+
         post_setup.assert_called_once_with("openai_codex")
+        assert config["stt"]["provider"] == "local"

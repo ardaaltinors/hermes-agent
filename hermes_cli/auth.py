@@ -3671,7 +3671,13 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: Optional[str] = None,
+    label: Optional[str] = None,
+    *,
+    set_active: bool = True,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3689,7 +3695,9 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _store_provider_state(
+            auth_store, "openai-codex", state, set_active=set_active
+        )
         _sync_codex_pool_entries(
             auth_store,
             tokens,
@@ -4389,14 +4397,12 @@ def has_codex_runtime_credentials() -> bool:
     the network, so status and picker UIs can use it safely.
     """
     try:
-        data = _read_codex_tokens()
-    except AuthError:
-        data = None
-    if isinstance(data, dict):
-        tokens = data.get("tokens")
-        if isinstance(tokens, dict) and str(tokens.get("access_token") or "").strip():
-            return True
-    return bool(_pool_codex_access_token())
+        from agent.credential_pool import load_pool
+
+        return load_pool("openai-codex").has_available()
+    except Exception:
+        logger.debug("Codex credential availability probe failed", exc_info=True)
+        return False
 
 
 # =============================================================================
@@ -7712,6 +7718,20 @@ def login_command(args) -> None:
     print("Use 'hermes auth' to manage credentials,")
     print("'hermes model' to select a provider, or 'hermes setup' for full setup.")
     raise SystemExit(0)
+
+
+def login_openai_codex_credentials_only() -> bool:
+    """Ensure Codex OAuth credentials without changing the inference provider."""
+    if has_codex_runtime_credentials():
+        return True
+
+    creds = _codex_device_code_login()
+    _save_codex_tokens(
+        creds["tokens"],
+        creds.get("last_refresh"),
+        set_active=False,
+    )
+    return has_codex_runtime_credentials()
 
 
 def _login_openai_codex(
