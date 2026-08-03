@@ -632,6 +632,22 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         return false
       }
 
+      if (providerId === 'openai-codex' && start.user_code) {
+        const authorizationCode = start.user_code
+
+        notify({
+          kind: 'warning',
+          title: 'OpenAI Codex authorization code',
+          message: authorizationCode,
+          action: {
+            label: 'Copy code',
+            onClick: () => {
+              void navigator.clipboard?.writeText(authorizationCode)
+            }
+          }
+        })
+      }
+
       const url = start.verification_url
 
       if (window.hermesDesktop?.openExternal) {

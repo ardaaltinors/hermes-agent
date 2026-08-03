@@ -926,6 +926,13 @@ describe('ToolsetConfigPanel', () => {
 
   describe('Codex STT OAuth activation', () => {
     it('authenticates before persisting the STT provider selection', async () => {
+      const { notify } = await import('@/store/notifications')
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText }
+      })
+
       getToolsetConfig.mockResolvedValue(
         config({
           name: 'stt',
@@ -972,6 +979,23 @@ describe('ToolsetConfigPanel', () => {
         fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
         await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex', false))
+        await waitFor(() =>
+          expect(notify).toHaveBeenCalledWith(
+            expect.objectContaining({
+              title: 'OpenAI Codex authorization code',
+              message: 'CODEX-1234',
+              action: expect.objectContaining({ label: 'Copy code' })
+            })
+          )
+        )
+
+        const codeNotice = vi
+          .mocked(notify)
+          .mock.calls.map(call => call[0])
+          .find(call => call.title === 'OpenAI Codex authorization code')
+
+        codeNotice?.action?.onClick()
+        expect(writeText).toHaveBeenCalledWith('CODEX-1234')
         expect(selectToolsetProvider).not.toHaveBeenCalled()
         await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'codex-session'), {
           timeout: 8000
