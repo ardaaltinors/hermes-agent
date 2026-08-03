@@ -434,6 +434,13 @@ TOOL_CATEGORIES = {
                 "override_env_vars": ["VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"],
             },
             {
+                "name": "OpenAI Codex OAuth",
+                "badge": "subscription",
+                "tag": "ChatGPT/Codex dictation via your existing OAuth login",
+                "env_vars": [],
+                "stt_provider": "openai-codex",
+            },
+            {
                 "name": "OpenAI",
                 "badge": "paid",
                 "tag": "whisper-1, gpt-4o-transcribe, gpt-transcribe",

@@ -8,6 +8,7 @@ Provides speech-to-text transcription with six providers:
     Auto-downloads the model (~150 MB for ``base``) on first use.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
+  - **openai-codex** — ChatGPT/Codex subscription dictation via OAuth.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
@@ -28,6 +29,7 @@ Usage::
 """
 
 import logging
+import mimetypes
 import os
 import platform
 import queue
@@ -41,6 +43,8 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
+
+import requests
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
@@ -119,6 +123,9 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_CODEX_TRANSCRIBE_URL = os.getenv(
+    "STT_OPENAI_CODEX_URL", "https://chatgpt.com/backend-api/transcribe"
+)
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
@@ -201,6 +208,24 @@ def _has_openai_audio_backend() -> bool:
         return True
     except ValueError:
         return False
+
+
+def _resolve_codex_stt_credentials(*, force_refresh: bool = False) -> Dict[str, Any]:
+    """Resolve Hermes-owned ChatGPT/Codex OAuth credentials for dictation."""
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    return resolve_codex_runtime_credentials(
+        force_refresh=force_refresh,
+        refresh_if_expiring=True,
+    )
+
+
+def _has_codex_stt_backend() -> bool:
+    try:
+        creds = _resolve_codex_stt_credentials()
+    except Exception:
+        return False
+    return bool(str(creds.get("api_key") or "").strip())
 
 
 def _find_binary(binary_name: str) -> Optional[str]:
@@ -343,6 +368,7 @@ BUILTIN_STT_PROVIDERS = frozenset({
     "local_command",
     "groq",
     "openai",
+    "openai-codex",
     "mistral",
     "xai",
     "elevenlabs",
@@ -1019,6 +1045,14 @@ def _get_provider(stt_config: dict) -> str:
                 return "openai"
             logger.warning(
                 "STT provider 'openai' configured but no API key available"
+            )
+            return "none"
+
+        if provider == "openai-codex":
+            if _has_codex_stt_backend():
+                return "openai-codex"
+            logger.warning(
+                "STT provider 'openai-codex' configured but no ChatGPT/Codex OAuth login is available"
             )
             return "none"
 
@@ -1999,6 +2033,127 @@ def _transcribe_openai(
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
 # ---------------------------------------------------------------------------
+# Provider: openai-codex (ChatGPT/Codex subscription OAuth)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_openai_codex(
+    file_path: str,
+    *,
+    language: str = "",
+    timeout: int = 120,
+) -> Dict[str, Any]:
+    """Transcribe through Codex's subscription-backed dictation endpoint.
+
+    This is the same private ChatGPT backend used by first-party Codex
+    dictation, not the separately billed OpenAI Platform audio API. The
+    ``codex-cli`` user agent is required: ChatGPT's edge otherwise presents a
+    browser challenge to non-browser clients before OAuth is evaluated.
+    """
+
+    def _request(creds: Dict[str, Any]):
+        token = str(creds.get("api_key") or "").strip()
+        if not token:
+            raise ValueError("ChatGPT/Codex OAuth login is missing")
+
+        suffix = Path(file_path).suffix.lower()
+        mime_type = {
+            ".webm": "audio/webm",
+            ".ogg": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".m4a": "audio/mp4",
+            ".mp4": "audio/mp4",
+        }.get(suffix) or mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        form_data = {"language": language} if language else {}
+        with open(file_path, "rb") as audio_file:
+            return requests.post(
+                OPENAI_CODEX_TRANSCRIBE_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "User-Agent": "codex-cli",
+                },
+                files={"file": (Path(file_path).name, audio_file, mime_type)},
+                data=form_data,
+                timeout=timeout,
+            )
+
+    try:
+        credentials = _resolve_codex_stt_credentials()
+        response = _request(credentials)
+
+        # A token can expire between resolution and upload. Force one refresh
+        # and replay with a newly opened file handle; never loop indefinitely.
+        if response.status_code == 401:
+            credentials = _resolve_codex_stt_credentials(force_refresh=True)
+            response = _request(credentials)
+
+        if response.status_code == 403 and response.headers.get("cf-mitigated") == "challenge":
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "ChatGPT blocked Codex OAuth transcription at its edge; retry later.",
+            }
+
+        response.raise_for_status()
+        payload = response.json()
+        transcript = str(payload.get("text") or "").strip()
+        if not transcript:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Codex OAuth transcription returned no text.",
+            }
+
+        logger.info(
+            "Transcribed %s via Codex OAuth (lang=%s, %d chars)",
+            Path(file_path).name,
+            language or "auto",
+            len(transcript),
+        )
+        return {
+            "success": True,
+            "transcript": transcript,
+            "provider": "openai-codex",
+        }
+    except PermissionError:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Permission denied: {file_path}",
+        }
+    except requests.Timeout:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Codex OAuth transcription request timed out.",
+        }
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Could not connect to ChatGPT for Codex OAuth transcription.",
+        }
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"Codex OAuth transcription failed with HTTP {status}.",
+        }
+    except (ValueError, KeyError) as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
+    except Exception as exc:
+        logger.error("Codex OAuth transcription failed: %s", exc, exc_info=True)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Codex OAuth transcription failed unexpectedly.",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Provider: mistral (Voxtral Transcribe API)
 # ---------------------------------------------------------------------------
 
@@ -2434,6 +2589,28 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
         return _transcribe_openai(file_path, model_name)
 
+    if provider == "openai-codex":
+        codex_cfg = stt_config.get("openai_codex") or {}
+        # An explicitly configured empty string means auto-detect. Do not let
+        # the legacy HERMES_LOCAL_STT_LANGUAGE/default-English fallback turn
+        # that into a forced English hint.
+        if "language" in codex_cfg:
+            language = str(codex_cfg.get("language") or "").strip()
+        else:
+            language = str(
+                _resolve_stt_language("openai-codex", stt_config) or ""
+            ).strip()
+        try:
+            timeout = int(codex_cfg.get("timeout", 120))
+        except (TypeError, ValueError):
+            timeout = 120
+        timeout = max(1, min(timeout, 600))
+        return _transcribe_openai_codex(
+            file_path,
+            language=language,
+            timeout=timeout,
+        )
+
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral") or {}
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
@@ -2513,6 +2690,7 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
         "error": (
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
+            "sign in to OpenAI Codex and set stt.provider to openai-codex, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
             "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
             "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "

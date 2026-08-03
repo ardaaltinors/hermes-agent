@@ -181,6 +181,30 @@ def test_apply_nous_managed_defaults_writes_video_gen_config(monkeypatch):
 # STT — managed-by-Nous detection (Phase 4 follow-up)
 # ---------------------------------------------------------------------------
 
+def test_stt_codex_oauth_provider_uses_hermes_auth_store(monkeypatch):
+    monkeypatch.setattr(ns, "get_env_value", lambda name: "")
+    monkeypatch.setattr(
+        ns,
+        "get_nous_portal_account_info",
+        lambda **kw: _account(logged_in=False),
+    )
+    monkeypatch.setattr(ns, "_toolset_enabled", lambda config, key: False)
+    monkeypatch.setattr(ns, "_has_agent_browser", lambda: False)
+    monkeypatch.setattr(ns, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(ns, "_codex_stt_backend_available", lambda: True)
+    monkeypatch.setattr(ns, "has_direct_modal_credentials", lambda: False)
+    monkeypatch.setattr(ns, "is_managed_tool_gateway_ready", lambda vendor: False)
+
+    features = ns.get_nous_subscription_features(
+        {"stt": {"provider": "openai-codex"}}
+    )
+
+    assert features.stt.available is True
+    assert features.stt.active is True
+    assert features.stt.managed_by_nous is False
+    assert features.stt.current_provider == "OpenAI Codex OAuth"
+    assert features.stt.explicit_configured is True
+
 
 
 

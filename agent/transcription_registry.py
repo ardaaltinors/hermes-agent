@@ -42,6 +42,7 @@ _BUILTIN_NAMES = frozenset({
     "local_command",
     "groq",
     "openai",
+    "openai-codex",
     "mistral",
     "xai",
     "elevenlabs",
