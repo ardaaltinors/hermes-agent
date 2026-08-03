@@ -635,6 +635,12 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
     try {
       const start = await startOAuthLogin(providerId, providerId !== 'openai-codex')
 
+      if (!mountedRef.current) {
+        await cancelOAuthSession(start.session_id).catch(() => undefined)
+
+        return false
+      }
+
       if (start.flow !== 'device_code') {
         notifyError(new Error(`unexpected flow: ${start.flow}`), copy.failedSelect(providerId))
 

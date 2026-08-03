@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  CODEX_OAUTH_START_TIMEOUT_MS,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -21,6 +22,7 @@ import {
   resetSidebarBatchCapability,
   setApiRequestProfile,
   speakText,
+  startOAuthLogin,
   transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
@@ -59,6 +61,18 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('allows Codex OAuth start to outlive the backend retry window', async () => {
+    await startOAuthLogin('openai-codex', false)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/providers/oauth/openai-codex/start?activate_provider=false',
+        timeoutMs: CODEX_OAUTH_START_TIMEOUT_MS
+      })
+    )
+    expect(CODEX_OAUTH_START_TIMEOUT_MS).toBeGreaterThan(245_000)
   })
 
   it('uses a longer timeout for the all-profile session list', async () => {

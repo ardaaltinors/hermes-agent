@@ -5,7 +5,7 @@ import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ToolsetConfig } from '@/types/hermes'
+import type { OAuthStartResponse, ToolsetConfig } from '@/types/hermes'
 
 // EnvVarField navigates to Settings → Keys via useNavigate, so every render
 // needs a router context. The navigate spy asserts the deep-link target.
@@ -1050,6 +1050,59 @@ describe('ToolsetConfigPanel', () => {
         rendered.unmount()
 
         await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('abandoned-codex-session'))
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+      } finally {
+        openSpy.mockRestore()
+      }
+    })
+
+    it('cancels when an in-flight OAuth start resolves after unmount', async () => {
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      let resolveStart: ((value: OAuthStartResponse) => void) | undefined
+
+      startOAuthLogin.mockReturnValue(
+        new Promise<OAuthStartResponse>(resolve => {
+          resolveStart = resolve
+        })
+      )
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+      try {
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+        const rendered = render(<ToolsetConfigPanel toolset="stt" />)
+
+        fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalled())
+        rendered.unmount()
+        resolveStart?.({
+          flow: 'device_code',
+          session_id: 'late-start-session',
+          user_code: 'LATE-1234',
+          verification_url: 'https://auth.openai.com/device',
+          poll_interval: 5,
+          expires_in: 900
+        })
+
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-start-session'))
+        expect(openSpy).not.toHaveBeenCalled()
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
         openSpy.mockRestore()

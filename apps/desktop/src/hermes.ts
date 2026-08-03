@@ -867,12 +867,17 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
+// The backend permits four 15s device-code requests plus three 60s capped
+// Retry-After delays (245s total with margin). Keep transport timeout above it.
+export const CODEX_OAUTH_START_TIMEOUT_MS = 255_000
+
 export function startOAuthLogin(providerId: string, activateProvider = true): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
     ...profileScoped(),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start?activate_provider=${activateProvider}`,
     method: 'POST',
-    body: {}
+    body: {},
+    ...(providerId === 'openai-codex' ? { timeoutMs: CODEX_OAUTH_START_TIMEOUT_MS } : {})
   })
 }
 
