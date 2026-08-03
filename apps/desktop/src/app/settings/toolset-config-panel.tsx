@@ -22,7 +22,7 @@ import { useI18n } from '@/i18n'
 import { Check, Loader2, Save, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
-import { notify, notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import type {
   ActionStatusResponse,
   ToolEnvVar,
@@ -504,6 +504,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // Guard the OAuth sign-in poll loop against unmount/state updates.
   const mountedRef = useRef(true)
   const activeOAuthSessionRef = useRef<string | null>(null)
+  const popupRecoveryNotificationRef = useRef<string | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- mount flag guarding an async poll loop, not an atom mirror
   useEffect(() => {
@@ -512,8 +513,14 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
     return () => {
       mountedRef.current = false
       const sessionId = activeOAuthSessionRef.current
+      const notificationId = popupRecoveryNotificationRef.current
 
       activeOAuthSessionRef.current = null
+      popupRecoveryNotificationRef.current = null
+
+      if (notificationId) {
+        dismissNotification(notificationId)
+      }
 
       if (sessionId) {
         void cancelOAuthSession(sessionId)
@@ -670,6 +677,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       }
 
       const url = start.verification_url
+      const isCurrent = () => mountedRef.current && activeOAuthSessionRef.current === start.session_id
       let opened = false
 
       if (window.hermesDesktop?.openExternal) {
@@ -677,24 +685,43 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
           await window.hermesDesktop.openExternal(url)
           opened = true
         } catch {
-          opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
+          if (isCurrent()) {
+            opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
+          }
         }
-      } else {
+      } else if (isCurrent()) {
         opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
       }
 
+      if (!isCurrent()) {
+        return false
+      }
+
       if (!opened) {
-        notify({
+        popupRecoveryNotificationRef.current = notify({
           kind: 'warning',
           title: 'Sign-in window was blocked',
           message: 'Allow pop-ups, then open the authorization page to continue.',
           action: {
             label: 'Open sign-in page',
             onClick: () => {
-              window.open(url, '_blank', 'noopener,noreferrer')
+              if (isCurrent()) {
+                window.open(url, '_blank', 'noopener,noreferrer')
+              }
+
+              const notificationId = popupRecoveryNotificationRef.current
+
+              popupRecoveryNotificationRef.current = null
+
+              if (notificationId) {
+                dismissNotification(notificationId)
+              }
             }
           }
         })
+      } else if (popupRecoveryNotificationRef.current) {
+        dismissNotification(popupRecoveryNotificationRef.current)
+        popupRecoveryNotificationRef.current = null
       }
 
       const pollIntervalMs = Math.max(1000, start.poll_interval * 1000)

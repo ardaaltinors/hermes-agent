@@ -149,6 +149,112 @@ describe('refreshOnboarding', () => {
     expect($desktopOnboarding.get().flow.status).toBe('idle')
   })
 
+  it('does not open a browser fallback when bridge failure resolves after cancellation', async () => {
+    let rejectOpen: ((reason?: unknown) => void) | undefined
+
+    const openExternal = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectOpen = reject
+        })
+    )
+
+    const originalDesktop = Object.getOwnPropertyDescriptor(window, 'hermesDesktop')
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'bridge-race-session',
+          user_code: 'BRIDGE-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/bridge-race-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      installApiMock(api)
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { ...window.hermesDesktop, openExternal }
+      })
+      const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalled())
+      cancelOnboardingFlow()
+      rejectOpen?.(new Error('bridge unavailable'))
+      await operation
+
+      expect(openSpy).not.toHaveBeenCalled()
+      expect($desktopOnboarding.get().flow.status).toBe('idle')
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/bridge-race-session',
+          method: 'DELETE'
+        })
+      )
+    } finally {
+      openSpy.mockRestore()
+
+      if (originalDesktop) {
+        Object.defineProperty(window, 'hermesDesktop', originalDesktop)
+      } else {
+        Reflect.deleteProperty(window, 'hermesDesktop')
+      }
+    }
+  })
+
+  it('dismisses popup recovery and prevents its stale action after cancellation', async () => {
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'popup-recovery-session',
+          user_code: 'POPUP-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/popup-recovery-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      notifications.clearNotifications()
+      installApiMock(api)
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      const recovery = notifications.$notifications.get().find(item => item.title === 'Sign-in window was blocked')
+
+      expect(recovery?.action).toBeTruthy()
+      cancelOnboardingFlow()
+      recovery?.action?.onClick()
+
+      expect(openSpy).toHaveBeenCalledTimes(1)
+      expect(notifications.$notifications.get().some(item => item.id === recovery?.id)).toBe(false)
+    } finally {
+      openSpy.mockRestore()
+      notifications.clearNotifications()
+    }
+  })
+
   it('ignores an in-flight poll that approves after manual onboarding closes', async () => {
     vi.useFakeTimers()
     let resolvePoll: ((value: OAuthPollResponse) => void) | undefined

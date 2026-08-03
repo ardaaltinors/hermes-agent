@@ -1109,6 +1109,73 @@ describe('ToolsetConfigPanel', () => {
       }
     })
 
+    it('does not open a browser fallback when bridge failure resolves after unmount', async () => {
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      startOAuthLogin.mockResolvedValue({
+        flow: 'device_code',
+        session_id: 'bridge-race-settings-session',
+        user_code: 'BRIDGE-5678',
+        verification_url: 'https://auth.openai.com/device',
+        poll_interval: 5,
+        expires_in: 900
+      })
+      let rejectOpen: ((reason?: unknown) => void) | undefined
+
+      const openExternal = vi.fn(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectOpen = reject
+          })
+      )
+
+      const originalDesktop = Object.getOwnPropertyDescriptor(window, 'hermesDesktop')
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+      try {
+        Object.defineProperty(window, 'hermesDesktop', {
+          configurable: true,
+          value: { ...window.hermesDesktop, openExternal }
+        })
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+        const rendered = render(<ToolsetConfigPanel toolset="stt" />)
+
+        fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+        await waitFor(() => expect(openExternal).toHaveBeenCalled())
+        rendered.unmount()
+        rejectOpen?.(new Error('bridge unavailable'))
+
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('bridge-race-settings-session'))
+        expect(openSpy).not.toHaveBeenCalled()
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+      } finally {
+        openSpy.mockRestore()
+
+        if (originalDesktop) {
+          Object.defineProperty(window, 'hermesDesktop', originalDesktop)
+        } else {
+          Reflect.deleteProperty(window, 'hermesDesktop')
+        }
+      }
+    })
+
     it('does not select a provider when an in-flight poll approves after unmount', async () => {
       getToolsetConfig.mockResolvedValue(
         config({

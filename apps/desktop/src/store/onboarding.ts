@@ -14,7 +14,7 @@ import {
 } from '@/hermes'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
-import { notify, notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import type { ModelOptionProvider, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
 type PkceStart = Extract<OAuthStartResponse, { flow: 'pkce' }>
@@ -163,6 +163,7 @@ let providersRefreshPromise: null | Promise<void> = null
 let oauthOperationGeneration = 0
 let pollRequestGeneration: number | null = null
 let activeOAuthSessionId: string | null = null
+const OAUTH_POPUP_RECOVERY_NOTIFICATION_ID = 'onboarding-oauth-popup-recovery'
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -194,6 +195,7 @@ function invalidateCurrentOAuthFlow() {
   const sessionId = activeOAuthSessionId ?? sessionIdFor($desktopOnboarding.get().flow)
 
   activeOAuthSessionId = null
+  dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
 
   if (sessionId) {
     cancelOAuthSession(sessionId).catch(() => undefined)
@@ -521,6 +523,7 @@ export function completeDesktopOnboarding() {
   oauthOperationGeneration += 1
   clearPoll()
   activeOAuthSessionId = null
+  dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
   writeCachedConfigured(true)
   // A real provider is now connected, so any earlier "choose later" skip is
   // moot — clear it so the flag never lingers in a configured install.
@@ -610,7 +613,7 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
 // when the bridge isn't present (e.g. the web dashboard / dev preview) so
 // the flow never silently stalls in a waiting state. Mirrors the pattern in
 // apps/desktop/src/app/artifacts/index.tsx.
-async function openSignInUrl(url: string) {
+async function openSignInUrl(url: string, isCurrent: () => boolean) {
   if (window.hermesDesktop?.openExternal) {
     try {
       await window.hermesDesktop.openExternal(url)
@@ -621,6 +624,10 @@ async function openSignInUrl(url: string) {
       // through to window.open so the sign-in URL still opens and the flow
       // doesn't strand a pending OAuth session in a waiting state.
     }
+  }
+
+  if (!isCurrent()) {
+    return false
   }
 
   return window.open(url, '_blank', 'noopener,noreferrer') !== null
@@ -650,7 +657,8 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
     activeOAuthSessionId = start.session_id
 
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
-    const opened = await openSignInUrl(browserUrl)
+    const isCurrent = () => oauthOperationIsCurrent(operationGeneration, start.session_id)
+    const opened = await openSignInUrl(browserUrl, isCurrent)
 
     if (operationGeneration !== oauthOperationGeneration) {
       await cancelOAuthSession(start.session_id).catch(() => undefined)
@@ -660,16 +668,23 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 
     if (!opened) {
       notify({
+        id: OAUTH_POPUP_RECOVERY_NOTIFICATION_ID,
         kind: 'warning',
         title: 'Sign-in window was blocked',
         message: 'Allow pop-ups, then open the authorization page to continue.',
         action: {
           label: 'Open sign-in page',
           onClick: () => {
-            window.open(browserUrl, '_blank', 'noopener,noreferrer')
+            if (isCurrent()) {
+              window.open(browserUrl, '_blank', 'noopener,noreferrer')
+            }
+
+            dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
           }
         }
       })
+    } else {
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
     }
 
     if (start.flow === 'pkce') {
