@@ -2,6 +2,7 @@
 
 from hermes_cli.nous_account import NousPortalAccountInfo, NousToolAccessInfo
 from hermes_cli import nous_subscription as ns
+from hermes_cli import auth
 
 
 _POOL_COVERAGE = {
@@ -204,6 +205,28 @@ def test_stt_codex_oauth_provider_uses_hermes_auth_store(monkeypatch):
     assert features.stt.managed_by_nous is False
     assert features.stt.current_provider == "OpenAI Codex OAuth"
     assert features.stt.explicit_configured is True
+
+
+def test_codex_stt_backend_uses_runtime_resolver_without_refresh(monkeypatch):
+    calls = []
+
+    def _resolve(**kwargs):
+        calls.append(kwargs)
+        return {"api_key": "pool-token", "source": "credential_pool"}
+
+    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", _resolve)
+
+    assert ns._codex_stt_backend_available() is True
+    assert calls == [{"refresh_if_expiring": False}]
+
+
+def test_codex_stt_backend_is_unavailable_when_runtime_resolver_fails(monkeypatch):
+    def _resolve(**_kwargs):
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", _resolve)
+
+    assert ns._codex_stt_backend_available() is False
 
 
 

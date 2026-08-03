@@ -270,12 +270,12 @@ def _local_stt_backend_available() -> bool:
 
 
 def _codex_stt_backend_available() -> bool:
-    """Cheap local check for a Hermes-owned Codex OAuth session."""
+    """Return whether the runtime resolver can supply Codex OAuth credentials."""
     try:
-        from hermes_cli.auth import _read_codex_tokens
+        from hermes_cli.auth import resolve_codex_runtime_credentials
 
-        tokens = _read_codex_tokens().get("tokens") or {}
-        return bool(str(tokens.get("access_token") or "").strip())
+        credentials = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+        return bool(str(credentials.get("api_key") or "").strip())
     except Exception:
         return False
 
@@ -455,7 +455,9 @@ def get_nous_subscription_features(
     # signal is whether faster-whisper is importable; we lazy-import so
     # this module stays cheap on the happy path.
     direct_openai_stt = bool(resolve_openai_audio_api_key())
-    direct_codex_stt = _codex_stt_backend_available()
+    direct_codex_stt = bool(
+        stt_provider == "openai-codex" and _codex_stt_backend_available()
+    )
     direct_groq_stt = bool(get_env_value("GROQ_API_KEY"))
     direct_mistral_stt = bool(get_env_value("MISTRAL_API_KEY"))
     try:
@@ -481,6 +483,7 @@ def get_nous_subscription_features(
         direct_elevenlabs = False
     if stt_use_gateway:
         direct_openai_stt = False
+        direct_codex_stt = False
         direct_groq_stt = False
         direct_mistral_stt = False
         local_stt_available = False

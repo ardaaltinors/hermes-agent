@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with multiple providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -43,8 +43,6 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
-
-import requests
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
@@ -123,9 +121,7 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_CODEX_TRANSCRIBE_URL = os.getenv(
-    "STT_OPENAI_CODEX_URL", "https://chatgpt.com/backend-api/transcribe"
-)
+OPENAI_CODEX_TRANSCRIBE_URL = "https://chatgpt.com/backend-api/transcribe"
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
@@ -212,12 +208,24 @@ def _has_openai_audio_backend() -> bool:
 
 def _resolve_codex_stt_credentials(*, force_refresh: bool = False) -> Dict[str, Any]:
     """Resolve Hermes-owned ChatGPT/Codex OAuth credentials for dictation."""
+    from hermes_cli.auth import AuthError, _read_codex_tokens
     from hermes_cli.auth import resolve_codex_runtime_credentials
 
-    return resolve_codex_runtime_credentials(
+    credentials = resolve_codex_runtime_credentials(
         force_refresh=force_refresh,
         refresh_if_expiring=True,
     )
+    try:
+        token_data = _read_codex_tokens()
+        tokens = token_data.get("tokens") or {}
+        account_id = str(tokens.get("account_id") or "").strip()
+        if account_id:
+            credentials = dict(credentials)
+            credentials["account_id"] = account_id
+    except AuthError:
+        # Pool-only credentials have no singleton account ID; the header is optional.
+        pass
+    return credentials
 
 
 def _has_codex_stt_backend() -> bool:
@@ -2050,6 +2058,7 @@ def _transcribe_openai_codex(
     ``codex-cli`` user agent is required: ChatGPT's edge otherwise presents a
     browser challenge to non-browser clients before OAuth is evaluated.
     """
+    import requests
 
     def _request(creds: Dict[str, Any]):
         token = str(creds.get("api_key") or "").strip()
@@ -2057,23 +2066,31 @@ def _transcribe_openai_codex(
             raise ValueError("ChatGPT/Codex OAuth login is missing")
 
         suffix = Path(file_path).suffix.lower()
-        mime_type = {
-            ".webm": "audio/webm",
-            ".ogg": "audio/ogg",
-            ".oga": "audio/ogg",
-            ".opus": "audio/ogg",
-            ".m4a": "audio/mp4",
-            ".mp4": "audio/mp4",
-        }.get(suffix) or mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        mime_type = (
+            {
+                ".webm": "audio/webm",
+                ".ogg": "audio/ogg",
+                ".oga": "audio/ogg",
+                ".opus": "audio/ogg",
+                ".m4a": "audio/mp4",
+                ".mp4": "audio/mp4",
+            }.get(suffix)
+            or mimetypes.guess_type(file_path)[0]
+            or "application/octet-stream"
+        )
         form_data = {"language": language} if language else {}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli",
+        }
+        account_id = str(creds.get("account_id") or "").strip()
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
         with open(file_path, "rb") as audio_file:
             return requests.post(
                 OPENAI_CODEX_TRANSCRIBE_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                    "User-Agent": "codex-cli",
-                },
+                headers=headers,
                 files={"file": (Path(file_path).name, audio_file, mime_type)},
                 data=form_data,
                 timeout=timeout,
@@ -2089,7 +2106,10 @@ def _transcribe_openai_codex(
             credentials = _resolve_codex_stt_credentials(force_refresh=True)
             response = _request(credentials)
 
-        if response.status_code == 403 and response.headers.get("cf-mitigated") == "challenge":
+        if (
+            response.status_code == 403
+            and response.headers.get("cf-mitigated") == "challenge"
+        ):
             return {
                 "success": False,
                 "transcript": "",

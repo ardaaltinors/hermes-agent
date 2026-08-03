@@ -33,6 +33,24 @@ def test_explicit_openai_codex_provider_uses_existing_oauth_login():
         assert _get_provider({"provider": "openai-codex"}) == "openai-codex"
 
 
+def test_codex_credentials_include_optional_chatgpt_account_id():
+    from tools.transcription_tools import _resolve_codex_stt_credentials
+
+    with (
+        patch(
+            "hermes_cli.auth.resolve_codex_runtime_credentials",
+            return_value={"api_key": "oauth-token", "source": "hermes-auth-store"},
+        ),
+        patch(
+            "hermes_cli.auth._read_codex_tokens",
+            return_value={"tokens": {"account_id": "account-123"}},
+        ),
+    ):
+        credentials = _resolve_codex_stt_credentials()
+
+    assert credentials["account_id"] == "account-123"
+
+
 def test_openai_codex_transcription_uses_subscription_endpoint(tmp_path):
     from tools.transcription_tools import _transcribe_openai_codex
 
@@ -43,9 +61,9 @@ def test_openai_codex_transcription_uses_subscription_endpoint(tmp_path):
     with (
         patch(
             "tools.transcription_tools._resolve_codex_stt_credentials",
-            return_value={"api_key": "oauth-token"},
+            return_value={"api_key": "oauth-token", "account_id": "account-123"},
         ),
-        patch("tools.transcription_tools.requests.post", return_value=response) as post,
+        patch("requests.post", return_value=response) as post,
     ):
         result = _transcribe_openai_codex(str(audio), language="tr")
 
@@ -57,6 +75,7 @@ def test_openai_codex_transcription_uses_subscription_endpoint(tmp_path):
     kwargs = post.call_args.kwargs
     assert post.call_args.args[0] == "https://chatgpt.com/backend-api/transcribe"
     assert kwargs["headers"]["Authorization"] == "Bearer oauth-token"
+    assert kwargs["headers"]["ChatGPT-Account-Id"] == "account-123"
     assert kwargs["headers"]["User-Agent"].startswith("codex-cli")
     assert kwargs["data"] == {"language": "tr"}
     filename, handle, mime = kwargs["files"]["file"]
@@ -79,7 +98,7 @@ def test_openai_codex_transcription_refreshes_once_after_unauthorized(tmp_path):
             "tools.transcription_tools._resolve_codex_stt_credentials", resolver
         ),
         patch(
-            "tools.transcription_tools.requests.post",
+            "requests.post",
             side_effect=[
                 _Response(status_code=401, text="expired"),
                 _Response(payload={"text": "yenilendi"}),
