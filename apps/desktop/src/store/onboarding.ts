@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import {
   cancelOAuthSession,
+  getApiRequestProfile,
   getGlobalModelOptions,
   getRecommendedDefaultModel,
   listOAuthProviders,
@@ -163,6 +164,7 @@ let providersRefreshPromise: null | Promise<void> = null
 let oauthOperationGeneration = 0
 let pollRequestGeneration: number | null = null
 let activeOAuthSessionId: string | null = null
+let activeOAuthProfile: null | string = null
 const OAUTH_POPUP_RECOVERY_NOTIFICATION_ID = 'onboarding-oauth-popup-recovery'
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -181,24 +183,33 @@ function clearPoll() {
   }
 }
 
-function oauthOperationIsCurrent(generation: number, sessionId: string): boolean {
+function oauthOperationIsCurrent(generation: number, sessionId: string, profile: null | string): boolean {
   if (generation !== oauthOperationGeneration) {
     return false
   }
 
-  return activeOAuthSessionId === sessionId
+  return activeOAuthSessionId === sessionId && activeOAuthProfile === profile && getApiRequestProfile() === profile
+}
+
+function clearFlowAfterProfileChange(generation: number, profile: null | string) {
+  if (generation === oauthOperationGeneration && getApiRequestProfile() !== profile) {
+    dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
+    setFlow({ status: 'idle' })
+  }
 }
 
 function invalidateCurrentOAuthFlow() {
   oauthOperationGeneration += 1
   clearPoll()
   const sessionId = activeOAuthSessionId ?? sessionIdFor($desktopOnboarding.get().flow)
+  const profile = activeOAuthProfile
 
   activeOAuthSessionId = null
+  activeOAuthProfile = null
   dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
 
   if (sessionId) {
-    cancelOAuthSession(sessionId).catch(() => undefined)
+    cancelOAuthSession(sessionId, profile).catch(() => undefined)
   }
 }
 
@@ -634,8 +645,25 @@ async function openSignInUrl(url: string, isCurrent: () => boolean) {
 }
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
+  const previousSessionId = activeOAuthSessionId
+  const previousProfile = activeOAuthProfile
+
   clearPoll()
   const operationGeneration = ++oauthOperationGeneration
+  const operationProfile = getApiRequestProfile()
+  activeOAuthSessionId = null
+  activeOAuthProfile = null
+  dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
+
+  if (previousSessionId) {
+    await cancelOAuthSession(previousSessionId, previousProfile).catch(() => undefined)
+  }
+
+  if (operationGeneration !== oauthOperationGeneration || getApiRequestProfile() !== operationProfile) {
+    clearFlowAfterProfileChange(operationGeneration, operationProfile)
+
+    return
+  }
 
   if (provider.flow === 'external') {
     setFlow({ status: 'external_pending', provider, copied: false })
@@ -646,22 +674,25 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
   setFlow({ status: 'starting', provider })
 
   try {
-    const start = await startOAuthLogin(provider.id)
+    const start = await startOAuthLogin(provider.id, true, operationProfile)
 
-    if (operationGeneration !== oauthOperationGeneration) {
-      await cancelOAuthSession(start.session_id).catch(() => undefined)
+    if (operationGeneration !== oauthOperationGeneration || getApiRequestProfile() !== operationProfile) {
+      await cancelOAuthSession(start.session_id, operationProfile).catch(() => undefined)
+      clearFlowAfterProfileChange(operationGeneration, operationProfile)
 
       return
     }
 
     activeOAuthSessionId = start.session_id
+    activeOAuthProfile = operationProfile
 
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
-    const isCurrent = () => oauthOperationIsCurrent(operationGeneration, start.session_id)
+    const isCurrent = () => oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)
     const opened = await openSignInUrl(browserUrl, isCurrent)
 
-    if (operationGeneration !== oauthOperationGeneration) {
-      await cancelOAuthSession(start.session_id).catch(() => undefined)
+    if (!isCurrent()) {
+      await cancelOAuthSession(start.session_id, operationProfile).catch(() => undefined)
+      clearFlowAfterProfileChange(operationGeneration, operationProfile)
 
       return
     }
@@ -675,10 +706,11 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
         action: {
           label: 'Open sign-in page',
           onClick: () => {
-            if (isCurrent()) {
-              window.open(browserUrl, '_blank', 'noopener,noreferrer')
+            if (!isCurrent()) {
+              return
             }
 
+            window.open(browserUrl, '_blank', 'noopener,noreferrer')
             dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
           }
         }
@@ -700,17 +732,20 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
       }
 
       pollRequestGeneration = operationGeneration
-      void pollSession(provider, start, ctx, operationGeneration).finally(() => {
+      void pollSession(provider, start, ctx, operationGeneration, operationProfile).finally(() => {
         if (pollRequestGeneration === operationGeneration) {
           pollRequestGeneration = null
         }
       })
     }, POLL_MS)
   } catch (error) {
-    if (operationGeneration !== oauthOperationGeneration) {
+    if (operationGeneration !== oauthOperationGeneration || getApiRequestProfile() !== operationProfile) {
+      clearFlowAfterProfileChange(operationGeneration, operationProfile)
+
       return
     }
 
+    dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
     setFlow({ status: 'error', provider, message: `Could not start sign-in: ${errMessage(error)}` })
   }
 }
@@ -720,24 +755,40 @@ async function pollSession(
   provider: OAuthProvider,
   start: DeviceStart,
   ctx: OnboardingContext,
-  operationGeneration: number
+  operationGeneration: number,
+  operationProfile: null | string
 ) {
-  try {
-    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+  if (!oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
+    clearPoll()
+    dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
+    await cancelOAuthSession(start.session_id, operationProfile).catch(() => undefined)
+    clearFlowAfterProfileChange(operationGeneration, operationProfile)
 
-    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+    return
+  }
+
+  try {
+    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id, operationProfile)
+
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
+      clearPoll()
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
+      await cancelOAuthSession(start.session_id, operationProfile).catch(() => undefined)
+      clearFlowAfterProfileChange(operationGeneration, operationProfile)
+
       return
     }
 
     if (status === 'approved') {
       clearPoll()
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
       setFlow({ status: 'success', provider })
       await completeWithModelConfirm(
         ctx,
         provider.name,
         [provider.id],
         reason => {
-          if (oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+          if (oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
             setFlow({
               status: 'error',
               provider,
@@ -746,18 +797,22 @@ async function pollSession(
           }
         },
         false,
-        () => oauthOperationIsCurrent(operationGeneration, start.session_id)
+        () => oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)
       )
     } else if (status !== 'pending') {
       clearPoll()
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
       setFlow({ status: 'error', provider, start, message: error_message || `Sign-in ${status}.` })
     }
   } catch (error) {
-    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
+      clearFlowAfterProfileChange(operationGeneration, operationProfile)
+
       return
     }
 
     clearPoll()
+    dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
     setFlow({ status: 'error', provider, start, message: `Polling failed: ${errMessage(error)}` })
   }
 }
@@ -779,25 +834,37 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
 
   const { provider, start, code } = flow
   const operationGeneration = oauthOperationGeneration
+  const operationProfile = activeOAuthProfile
+
+  if (getApiRequestProfile() !== operationProfile) {
+    invalidateCurrentOAuthFlow()
+    setFlow({ status: 'idle' })
+
+    return
+  }
 
   activeOAuthSessionId = start.session_id
   setFlow({ status: 'submitting', provider, start })
 
   try {
-    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
+    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim(), operationProfile)
 
-    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
+      await cancelOAuthSession(start.session_id, operationProfile).catch(() => undefined)
+
       return
     }
 
     if (resp.ok && resp.status === 'approved') {
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
       setFlow({ status: 'success', provider })
       await completeWithModelConfirm(
         ctx,
         provider.name,
         [provider.id],
         reason => {
-          if (oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+          if (oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
             setFlow({
               status: 'error',
               provider,
@@ -806,16 +873,18 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
           }
         },
         false,
-        () => oauthOperationIsCurrent(operationGeneration, start.session_id)
+        () => oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)
       )
     } else {
+      dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
       setFlow({ status: 'error', provider, start, message: resp.message || 'Token exchange failed.' })
     }
   } catch (error) {
-    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id, operationProfile)) {
       return
     }
 
+    dismissNotification(OAUTH_POPUP_RECOVERY_NOTIFICATION_ID)
     setFlow({ status: 'error', provider, start, message: errMessage(error) })
   }
 }

@@ -10118,7 +10118,21 @@ def _oauth_session_profile(
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
         profile = sess.get("profile") if sess else None
-    return profile or _oauth_profile_name(fallback)
+    # A registered session owns the profile captured at creation. In
+    # particular, None means the default profile and must not fall through to
+    # a later request's currently selected profile.
+    return profile if sess is not None else _oauth_profile_name(fallback)
+
+
+def _require_oauth_session_profile(
+    sess: Dict[str, Any], profile: Optional[str]
+) -> None:
+    """Reject cross-profile access to a profile-owned OAuth session."""
+    if sess.get("profile") != _oauth_profile_name(profile):
+        raise HTTPException(
+            status_code=409,
+            detail="Profile mismatch for OAuth session",
+        )
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -10215,6 +10229,7 @@ def _submit_anthropic_pkce(
         sess = _oauth_sessions.get(session_id)
     if not sess or sess["provider"] != "anthropic" or sess["flow"] != "pkce":
         raise HTTPException(status_code=404, detail="Unknown or expired session")
+    _require_oauth_session_profile(sess, profile)
     if sess["status"] != "pending":
         return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
 
@@ -10978,6 +10993,7 @@ async def poll_oauth_session(
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    _require_oauth_session_profile(sess, profile)
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -11004,6 +11020,7 @@ async def cancel_oauth_session(
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
         if sess is not None:
+            _require_oauth_session_profile(sess, profile)
             sess["cancelled"] = True
         _oauth_sessions.pop(session_id, None)
     if sess is None:

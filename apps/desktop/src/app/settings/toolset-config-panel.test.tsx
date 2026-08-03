@@ -40,6 +40,7 @@ const getActionStatus = vi.fn()
 const startOAuthLogin = vi.fn()
 const pollOAuthSession = vi.fn()
 const cancelOAuthSession = vi.fn()
+const getApiRequestProfile = vi.fn<() => null | string>(() => null)
 const getHermesConfigRecord = vi.fn()
 const getHermesConfigSchema = vi.fn()
 const saveHermesConfig = vi.fn()
@@ -58,19 +59,27 @@ vi.mock('@/hermes', () => ({
   revealEnvVar: (key: string) => revealEnvVar(key),
   runToolsetPostSetup: (name: string, key: string) => runToolsetPostSetup(name, key),
   getActionStatus: (name: string, lines?: number) => getActionStatus(name, lines),
-  startOAuthLogin: (providerId: string, activateProvider?: boolean) => startOAuthLogin(providerId, activateProvider),
-  pollOAuthSession: (providerId: string, sessionId: string) => pollOAuthSession(providerId, sessionId),
-  cancelOAuthSession: (sessionId: string) => cancelOAuthSession(sessionId),
+  getApiRequestProfile: () => getApiRequestProfile(),
+  startOAuthLogin: (providerId: string, activateProvider?: boolean, profile?: null | string) =>
+    startOAuthLogin(providerId, activateProvider, profile),
+  pollOAuthSession: (providerId: string, sessionId: string, profile?: null | string) =>
+    pollOAuthSession(providerId, sessionId, profile),
+  cancelOAuthSession: (sessionId: string, profile?: null | string) => cancelOAuthSession(sessionId, profile),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   getHermesConfigSchema: () => getHermesConfigSchema(),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config),
   getElevenLabsVoices: () => getElevenLabsVoices()
 }))
 
-vi.mock('@/store/notifications', () => ({
-  notify: vi.fn(),
-  notifyError: vi.fn()
-}))
+vi.mock('@/store/notifications', () => {
+  let nextNotificationId = 0
+
+  return {
+    notify: vi.fn(() => `notification-${++nextNotificationId}`),
+    dismissNotification: vi.fn(),
+    notifyError: vi.fn()
+  }
+})
 
 vi.mock('@/store/activity', () => ({
   upsertDesktopActionTask: vi.fn()
@@ -108,6 +117,7 @@ function config(overrides: Partial<ToolsetConfig> = {}): ToolsetConfig {
 }
 
 beforeEach(() => {
+  getApiRequestProfile.mockReturnValue(null)
   // Radix menus/selects call these on open; jsdom implements neither, so the
   // dropdown never opens without the stubs (mirrors model-settings.test.tsx).
   Element.prototype.scrollIntoView = vi.fn()
@@ -892,14 +902,14 @@ describe('ToolsetConfigPanel', () => {
         getToolsetConfig.mockClear()
         warning!.action!.onClick()
 
-        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('nous', true))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('nous', true, null))
         expect(openSpy).toHaveBeenCalledWith(
           'https://portal.nousresearch.com/device?user_code=NOUS-1234',
           '_blank',
           'noopener,noreferrer'
         )
         // Approved poll → the panel refetches the config so status flips.
-        await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('nous', 'sess-1'), { timeout: 8000 })
+        await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('nous', 'sess-1', null), { timeout: 8000 })
         await waitFor(() => expect(getToolsetConfig).toHaveBeenCalled(), { timeout: 8000 })
       } finally {
         openSpy.mockRestore()
@@ -929,7 +939,7 @@ describe('ToolsetConfigPanel', () => {
 
   describe('Codex STT OAuth activation', () => {
     it('authenticates before persisting the STT provider selection', async () => {
-      const { notify } = await import('@/store/notifications')
+      const { dismissNotification, notify } = await import('@/store/notifications')
       const writeText = vi.fn().mockResolvedValue(undefined)
       Object.defineProperty(navigator, 'clipboard', {
         configurable: true,
@@ -981,7 +991,7 @@ describe('ToolsetConfigPanel', () => {
         await screen.findByRole('button', { name: /OpenAI Codex OAuth/ })
         fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
-        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex', false))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalledWith('openai-codex', false, null))
         await waitFor(() =>
           expect(notify).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -1000,18 +1010,21 @@ describe('ToolsetConfigPanel', () => {
         codeNotice?.action?.onClick()
         expect(writeText).toHaveBeenCalledWith('CODEX-1234')
         expect(selectToolsetProvider).not.toHaveBeenCalled()
-        await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'codex-session'), {
+        await waitFor(() => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'codex-session', null), {
           timeout: 8000
         })
         await waitFor(() => expect(selectToolsetProvider).toHaveBeenCalledWith('stt', 'OpenAI Codex OAuth'), {
           timeout: 8000
         })
+        expect(dismissNotification).toHaveBeenCalledWith(expect.stringMatching(/^notification-/))
       } finally {
         openSpy.mockRestore()
       }
     }, 20000)
 
     it('cancels an unfinished OAuth session when the panel unmounts', async () => {
+      const { dismissNotification } = await import('@/store/notifications')
+
       getToolsetConfig.mockResolvedValue(
         config({
           name: 'stt',
@@ -1049,7 +1062,8 @@ describe('ToolsetConfigPanel', () => {
         await waitFor(() => expect(startOAuthLogin).toHaveBeenCalled())
         rendered.unmount()
 
-        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('abandoned-codex-session'))
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('abandoned-codex-session', null))
+        expect(dismissNotification).toHaveBeenCalledWith(expect.stringMatching(/^notification-/))
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
         openSpy.mockRestore()
@@ -1101,7 +1115,7 @@ describe('ToolsetConfigPanel', () => {
           expires_in: 900
         })
 
-        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-start-session'))
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-start-session', null))
         expect(openSpy).not.toHaveBeenCalled()
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
@@ -1162,7 +1176,7 @@ describe('ToolsetConfigPanel', () => {
         rendered.unmount()
         rejectOpen?.(new Error('bridge unavailable'))
 
-        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('bridge-race-settings-session'))
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('bridge-race-settings-session', null))
         expect(openSpy).not.toHaveBeenCalled()
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
@@ -1236,10 +1250,72 @@ describe('ToolsetConfigPanel', () => {
         rendered.unmount()
         resolvePoll?.({ status: 'approved', session_id: 'late-poll-session' })
 
-        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-poll-session'))
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-poll-session', null))
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
         timerSpy?.mockRestore()
+        openSpy.mockRestore()
+      }
+    })
+
+    it('pins OAuth polling to its initiating profile and rejects a stale approval after profile switch', async () => {
+      const { dismissNotification } = await import('@/store/notifications')
+
+      getApiRequestProfile.mockReturnValue('coder')
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      startOAuthLogin.mockResolvedValue({
+        flow: 'device_code',
+        session_id: 'profile-owned-session',
+        user_code: 'PROFILE-1234',
+        verification_url: 'https://auth.openai.com/device',
+        poll_interval: 1,
+        expires_in: 900
+      })
+      let resolvePoll: ((value: OAuthPollResponse) => void) | undefined
+
+      pollOAuthSession.mockReturnValue(
+        new Promise<OAuthPollResponse>(resolve => {
+          resolvePoll = resolve
+        })
+      )
+
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+
+      try {
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+
+        render(<ToolsetConfigPanel toolset="stt" />)
+        fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+
+        await waitFor(
+          () => expect(pollOAuthSession).toHaveBeenCalledWith('openai-codex', 'profile-owned-session', 'coder'),
+          { timeout: 3000 }
+        )
+        getApiRequestProfile.mockReturnValue('other')
+        resolvePoll?.({ status: 'approved', session_id: 'profile-owned-session' })
+
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('profile-owned-session', 'coder'))
+        expect(dismissNotification).toHaveBeenCalledWith(expect.stringMatching(/^notification-/))
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+      } finally {
         openSpy.mockRestore()
       }
     })

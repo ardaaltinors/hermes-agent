@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
+from agent.codex_headers import codex_cloudflare_headers
 from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -2131,14 +2132,16 @@ def _transcribe_openai_codex(
             or "application/octet-stream"
         )
         form_data = {"language": language} if language else {}
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "codex-cli",
-        }
+        headers = codex_cloudflare_headers(token)
+        headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+        )
         account_id = str(creds.get("account_id") or "").strip()
         if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
+            headers["ChatGPT-Account-ID"] = account_id
         with open(file_path, "rb") as audio_file:
             return requests.post(
                 OPENAI_CODEX_TRANSCRIBE_URL,

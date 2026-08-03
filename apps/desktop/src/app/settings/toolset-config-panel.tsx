@@ -8,6 +8,7 @@ import {
   cancelOAuthSession,
   deleteEnvVar,
   getActionStatus,
+  getApiRequestProfile,
   getToolsetConfig,
   getToolsetModels,
   pollOAuthSession,
@@ -503,8 +504,16 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   const providerChoiceClaimedRef = useRef(false)
   // Guard the OAuth sign-in poll loop against unmount/state updates.
   const mountedRef = useRef(true)
-  const activeOAuthSessionRef = useRef<string | null>(null)
-  const popupRecoveryNotificationRef = useRef<string | null>(null)
+  const oauthOperationGenerationRef = useRef(0)
+
+  const activeOAuthSessionRef = useRef<{
+    generation: number
+    profile: null | string
+    sessionId: string
+  } | null>(null)
+
+  const popupRecoveryNotificationRef = useRef<{ generation: number; id: string } | null>(null)
+  const authorizationCodeNotificationRef = useRef<{ generation: number; id: string } | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- mount flag guarding an async poll loop, not an atom mirror
   useEffect(() => {
@@ -512,18 +521,22 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
     return () => {
       mountedRef.current = false
-      const sessionId = activeOAuthSessionRef.current
-      const notificationId = popupRecoveryNotificationRef.current
+      oauthOperationGenerationRef.current += 1
+      const session = activeOAuthSessionRef.current
+      const notifications = [popupRecoveryNotificationRef.current, authorizationCodeNotificationRef.current]
 
       activeOAuthSessionRef.current = null
       popupRecoveryNotificationRef.current = null
+      authorizationCodeNotificationRef.current = null
 
-      if (notificationId) {
-        dismissNotification(notificationId)
+      for (const notification of notifications) {
+        if (notification) {
+          dismissNotification(notification.id)
+        }
       }
 
-      if (sessionId) {
-        void cancelOAuthSession(sessionId)
+      if (session) {
+        void cancelOAuthSession(session.sessionId, session.profile)
       }
     }
   }, [])
@@ -643,41 +656,112 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // machinery onboarding uses: start → open verification URL → poll), then
   // refetch the toolset config so is_active / status flip once entitled.
   async function signInToOAuthProvider(providerId: string): Promise<boolean> {
-    try {
-      const start = await startOAuthLogin(providerId, providerId !== 'openai-codex')
+    const generation = ++oauthOperationGenerationRef.current
+    const profile = getApiRequestProfile()
+    const previousSession = activeOAuthSessionRef.current
 
-      if (!mountedRef.current) {
-        await cancelOAuthSession(start.session_id).catch(() => undefined)
+    activeOAuthSessionRef.current = null
+
+    if (previousSession) {
+      void cancelOAuthSession(previousSession.sessionId, previousSession.profile).catch(() => undefined)
+    }
+
+    for (const ref of [popupRecoveryNotificationRef, authorizationCodeNotificationRef]) {
+      const notification = ref.current
+
+      ref.current = null
+
+      if (notification) {
+        dismissNotification(notification.id)
+      }
+    }
+
+    let sessionId: string | null = null
+
+    const operationIsCurrent = () =>
+      mountedRef.current && oauthOperationGenerationRef.current === generation && getApiRequestProfile() === profile
+
+    const sessionIsCurrent = () => {
+      const active = activeOAuthSessionRef.current
+
+      return (
+        operationIsCurrent() &&
+        active?.generation === generation &&
+        active.sessionId === sessionId &&
+        active.profile === profile
+      )
+    }
+
+    const dismissOperationNotifications = () => {
+      for (const ref of [popupRecoveryNotificationRef, authorizationCodeNotificationRef]) {
+        const notification = ref.current
+
+        if (notification?.generation === generation) {
+          ref.current = null
+          dismissNotification(notification.id)
+        }
+      }
+    }
+
+    const releaseSession = () => {
+      const active = activeOAuthSessionRef.current
+
+      if (active?.generation === generation && active.sessionId === sessionId && active.profile === profile) {
+        activeOAuthSessionRef.current = null
+      }
+
+      dismissOperationNotifications()
+    }
+
+    try {
+      const start = await startOAuthLogin(providerId, providerId !== 'openai-codex', profile)
+
+      sessionId = start.session_id
+
+      if (!operationIsCurrent()) {
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
 
         return false
       }
 
       if (start.flow !== 'device_code') {
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
         notifyError(new Error(`unexpected flow: ${start.flow}`), copy.failedSelect(providerId))
 
         return false
       }
 
-      activeOAuthSessionRef.current = start.session_id
+      activeOAuthSessionRef.current = { generation, profile, sessionId: start.session_id }
 
       if (providerId === 'openai-codex' && start.user_code) {
         const authorizationCode = start.user_code
+        let notificationId = ''
 
-        notify({
+        notificationId = notify({
           kind: 'warning',
           title: 'OpenAI Codex authorization code',
           message: authorizationCode,
           action: {
             label: 'Copy code',
             onClick: () => {
-              void navigator.clipboard?.writeText(authorizationCode)
+              if (sessionIsCurrent()) {
+                void navigator.clipboard?.writeText(authorizationCode)
+              }
+
+              const current = authorizationCodeNotificationRef.current
+
+              if (current?.generation === generation && current.id === notificationId) {
+                authorizationCodeNotificationRef.current = null
+              }
+
+              dismissNotification(notificationId)
             }
           }
         })
+        authorizationCodeNotificationRef.current = { generation, id: notificationId }
       }
 
       const url = start.verification_url
-      const isCurrent = () => mountedRef.current && activeOAuthSessionRef.current === start.session_id
       let opened = false
 
       if (window.hermesDesktop?.openExternal) {
@@ -685,64 +769,72 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
           await window.hermesDesktop.openExternal(url)
           opened = true
         } catch {
-          if (isCurrent()) {
+          if (sessionIsCurrent()) {
             opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
           }
         }
-      } else if (isCurrent()) {
+      } else if (sessionIsCurrent()) {
         opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
       }
 
-      if (!isCurrent()) {
+      if (!sessionIsCurrent()) {
+        releaseSession()
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
         return false
       }
 
       if (!opened) {
-        popupRecoveryNotificationRef.current = notify({
+        let notificationId = ''
+
+        notificationId = notify({
           kind: 'warning',
           title: 'Sign-in window was blocked',
           message: 'Allow pop-ups, then open the authorization page to continue.',
           action: {
             label: 'Open sign-in page',
             onClick: () => {
-              if (isCurrent()) {
+              if (sessionIsCurrent()) {
                 window.open(url, '_blank', 'noopener,noreferrer')
               }
 
-              const notificationId = popupRecoveryNotificationRef.current
+              const current = popupRecoveryNotificationRef.current
 
-              popupRecoveryNotificationRef.current = null
-
-              if (notificationId) {
-                dismissNotification(notificationId)
+              if (current?.generation === generation && current.id === notificationId) {
+                popupRecoveryNotificationRef.current = null
               }
+
+              dismissNotification(notificationId)
             }
           }
         })
-      } else if (popupRecoveryNotificationRef.current) {
-        dismissNotification(popupRecoveryNotificationRef.current)
-        popupRecoveryNotificationRef.current = null
+        popupRecoveryNotificationRef.current = { generation, id: notificationId }
       }
 
       const pollIntervalMs = Math.max(1000, start.poll_interval * 1000)
       const deadline = Date.now() + start.expires_in * 1000
 
-      // Poll until the server-advertised device-code lifetime expires.
-      while (mountedRef.current && Date.now() < deadline) {
+      while (sessionIsCurrent() && Date.now() < deadline) {
         await new Promise(resolve => window.setTimeout(resolve, pollIntervalMs))
 
-        if (!mountedRef.current) {
+        if (!sessionIsCurrent()) {
+          releaseSession()
+          await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
           return false
         }
 
-        const polled = await pollOAuthSession(providerId, start.session_id)
+        const polled = await pollOAuthSession(providerId, start.session_id, profile)
 
-        if (!mountedRef.current) {
+        if (!sessionIsCurrent()) {
+          releaseSession()
+          await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
           return false
         }
 
         if (polled.status === 'approved') {
-          activeOAuthSessionRef.current = null
+          releaseSession()
 
           if (providerId === 'nous') {
             notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
@@ -750,7 +842,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
           await refresh()
 
-          if (!mountedRef.current) {
+          if (!operationIsCurrent()) {
             return false
           }
 
@@ -760,27 +852,27 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         }
 
         if (polled.status !== 'pending') {
-          activeOAuthSessionRef.current = null
+          releaseSession()
           notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.failedSelect(providerId))
 
           return false
         }
       }
 
-      if (activeOAuthSessionRef.current === start.session_id) {
-        activeOAuthSessionRef.current = null
-        await cancelOAuthSession(start.session_id)
+      if (sessionIsCurrent()) {
+        releaseSession()
+        await cancelOAuthSession(start.session_id, profile)
       }
     } catch (err) {
-      const sessionId = activeOAuthSessionRef.current
+      const shouldNotify = operationIsCurrent()
 
-      activeOAuthSessionRef.current = null
+      releaseSession()
 
       if (sessionId) {
-        await cancelOAuthSession(sessionId).catch(() => undefined)
+        await cancelOAuthSession(sessionId, profile).catch(() => undefined)
       }
 
-      if (mountedRef.current) {
+      if (shouldNotify) {
         notifyError(err, copy.failedSelect(providerId))
       }
     }

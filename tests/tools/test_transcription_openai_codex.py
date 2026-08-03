@@ -90,8 +90,9 @@ def test_openai_codex_transcription_uses_subscription_endpoint(tmp_path):
     kwargs = post.call_args.kwargs
     assert post.call_args.args[0] == "https://chatgpt.com/backend-api/transcribe"
     assert kwargs["headers"]["Authorization"] == "Bearer oauth-token"
-    assert kwargs["headers"]["ChatGPT-Account-Id"] == "account-123"
-    assert kwargs["headers"]["User-Agent"].startswith("codex-cli")
+    assert kwargs["headers"]["ChatGPT-Account-ID"] == "account-123"
+    assert kwargs["headers"]["User-Agent"].startswith("codex_cli_rs/")
+    assert kwargs["headers"]["originator"] == "codex_cli_rs"
     assert kwargs["data"] == {"language": "tr"}
     assert kwargs["allow_redirects"] is False
     filename, handle, mime = kwargs["files"]["file"]

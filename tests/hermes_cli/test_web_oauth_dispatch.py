@@ -172,6 +172,80 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_oauth_poll_and_cancel_reject_cross_profile_session_access(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session(
+        "openai-codex", "device_code", profile="coder"
+    )
+    try:
+        wrong_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}?profile=other",
+            headers=HEADERS,
+        )
+        wrong_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}?profile=other",
+            headers=HEADERS,
+        )
+        omitted_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}",
+            headers=HEADERS,
+        )
+        omitted_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}",
+            headers=HEADERS,
+        )
+
+        assert wrong_poll.status_code == 409
+        assert wrong_cancel.status_code == 409
+        assert omitted_poll.status_code == 409
+        assert omitted_cancel.status_code == 409
+        assert session_id in ws._oauth_sessions
+
+        right_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}?profile=coder",
+            headers=HEADERS,
+        )
+        right_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}?profile=coder",
+            headers=HEADERS,
+        )
+
+        assert right_poll.status_code == 200
+        assert right_cancel.status_code == 200
+        assert session_id not in ws._oauth_sessions
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_oauth_session_profile_preserves_explicit_default_owner(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session("anthropic", "pkce", profile=None)
+    try:
+        assert ws._oauth_session_profile(session_id, "coder") is None
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_pkce_submit_rejects_omitted_profile_for_named_session(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session(
+        "anthropic", "pkce", profile="coder"
+    )
+    try:
+        with pytest.raises(ws.HTTPException) as exc_info:
+            ws._submit_anthropic_pkce(session_id, "code#state", profile=None)
+
+        assert exc_info.value.status_code == 409
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
 def test_codex_dashboard_start_forwards_credential_only_intent(monkeypatch):
     from hermes_cli import web_server as ws
 
@@ -347,7 +421,7 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
     def fake_sleep(_interval):
         # Simulate a real concurrent DELETE /api/providers/oauth/sessions/{sid}
         # firing while the worker is asleep between polls.
-        resp = client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        resp = client.delete(f"/api/providers/oauth/sessions/{sid}?profile=coder", headers=HEADERS)
         assert resp.status_code == 200, resp.text
 
     monkeypatch.setattr(ws.time, "sleep", fake_sleep)
@@ -436,7 +510,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
 
     def _fire_delete():
         delete_started.set()
-        client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        client.delete(f"/api/providers/oauth/sessions/{sid}?profile=coder", headers=HEADERS)
         delete_finished.set()
 
     monkeypatch.setattr(auth_mod, "_save_codex_device_login_tokens", fake_save)
@@ -487,7 +561,7 @@ def test_cancel_oauth_session_marks_dict_cancelled_before_popping():
     worker_ref = ws._oauth_sessions[session_id]
 
     resp = client.delete(
-        f"/api/providers/oauth/sessions/{session_id}",
+        f"/api/providers/oauth/sessions/{session_id}?profile=coder",
         headers=HEADERS,
     )
 

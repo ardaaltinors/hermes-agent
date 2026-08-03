@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestProfile } from '@/hermes'
 import * as notifications from '@/store/notifications'
 import type { OAuthPollResponse, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
@@ -94,11 +95,13 @@ function fallbackTimeoutGateway(): OnboardingContext['requestGateway'] {
 describe('refreshOnboarding', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    setApiRequestProfile(null)
     $desktopOnboarding.set(baseState())
   })
 
   afterEach(() => {
     window.localStorage.clear()
+    setApiRequestProfile(null)
     $desktopOnboarding.set(baseState())
     vi.restoreAllMocks()
   })
@@ -146,6 +149,85 @@ describe('refreshOnboarding', () => {
       })
     )
     expect(openSpy).not.toHaveBeenCalled()
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+  })
+
+  it('cancels and isolates the previous session when OAuth is replaced', async () => {
+    let startCount = 0
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        startCount += 1
+
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: `replacement-session-${startCount}`,
+          user_code: `REPLACE-${startCount}`,
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      notifications.clearNotifications()
+      installApiMock(api)
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+      const staleRecovery = notifications.$notifications.get().find(item => item.title === 'Sign-in window was blocked')
+
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/replacement-session-1',
+          method: 'DELETE'
+        })
+      )
+      expect($desktopOnboarding.get().flow.status).toBe('polling')
+
+      staleRecovery?.action?.onClick()
+
+      expect(openSpy).toHaveBeenCalledTimes(2)
+      expect(notifications.$notifications.get().some(item => item.title === 'Sign-in window was blocked')).toBe(true)
+    } finally {
+      cancelOnboardingFlow()
+      notifications.clearNotifications()
+      openSpy.mockRestore()
+    }
+  })
+
+  it('clears a failed OAuth start after its initiating profile changes', async () => {
+    let rejectStart: ((reason?: unknown) => void) | undefined
+
+    const api = vi.fn(
+      ({ path }: { path: string }) =>
+        new Promise<unknown>((_resolve, reject) => {
+          if (!path.includes('/start')) {
+            throw new Error(`unexpected api path: ${path}`)
+          }
+
+          rejectStart = reject
+        })
+    )
+
+    installApiMock(api)
+    setApiRequestProfile('coder')
+    const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+    await vi.waitFor(() => expect($desktopOnboarding.get().flow.status).toBe('starting'))
+
+    setApiRequestProfile('other')
+    rejectStart?.(new Error('old profile failed'))
+    await operation
+
     expect($desktopOnboarding.get().flow.status).toBe('idle')
   })
 
