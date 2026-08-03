@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import * as notifications from '@/store/notifications'
-import type { OAuthProvider, OAuthStartResponse } from '@/types/hermes'
+import type { OAuthPollResponse, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
 import {
   $desktopOnboarding,
   cancelOnboardingFlow,
+  closeManualOnboarding,
   type DesktopOnboardingState,
   type OnboardingContext,
   refreshOnboarding,
@@ -146,6 +147,68 @@ describe('refreshOnboarding', () => {
     )
     expect(openSpy).not.toHaveBeenCalled()
     expect($desktopOnboarding.get().flow.status).toBe('idle')
+  })
+
+  it('ignores an in-flight poll that approves after manual onboarding closes', async () => {
+    vi.useFakeTimers()
+    let resolvePoll: ((value: OAuthPollResponse) => void) | undefined
+
+    const pollPromise = new Promise<OAuthPollResponse>(resolve => {
+      resolvePoll = resolve
+    })
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'manual-poll-session',
+          user_code: 'MANUAL-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/poll/manual-poll-session')) {
+        return pollPromise
+      }
+
+      if (path.includes('/sessions/manual-poll-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway = vi.fn()
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+
+    try {
+      installApiMock(api)
+      $desktopOnboarding.set(baseState({ manual: true, requested: true }))
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(requestGateway))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({ path: '/api/providers/oauth/openai-codex/poll/manual-poll-session' })
+      )
+
+      closeManualOnboarding()
+      resolvePoll?.({ status: 'approved', session_id: 'manual-poll-session' })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect($desktopOnboarding.get().flow.status).toBe('idle')
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/manual-poll-session',
+          method: 'DELETE'
+        })
+      )
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
   })
 
   it('refreshes OAuth providers again when onboarding was explicitly requested', async () => {

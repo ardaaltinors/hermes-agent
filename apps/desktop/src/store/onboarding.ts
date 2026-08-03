@@ -161,6 +161,8 @@ export const $desktopOnboarding = atom<DesktopOnboardingState>(INITIAL)
 let pollTimer: number | null = null
 let providersRefreshPromise: null | Promise<void> = null
 let oauthOperationGeneration = 0
+let pollRequestGeneration: number | null = null
+let activeOAuthSessionId: string | null = null
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -175,6 +177,26 @@ function clearPoll() {
   if (pollTimer !== null) {
     window.clearInterval(pollTimer)
     pollTimer = null
+  }
+}
+
+function oauthOperationIsCurrent(generation: number, sessionId: string): boolean {
+  if (generation !== oauthOperationGeneration) {
+    return false
+  }
+
+  return activeOAuthSessionId === sessionId
+}
+
+function invalidateCurrentOAuthFlow() {
+  oauthOperationGeneration += 1
+  clearPoll()
+  const sessionId = activeOAuthSessionId ?? sessionIdFor($desktopOnboarding.get().flow)
+
+  activeOAuthSessionId = null
+
+  if (sessionId) {
+    cancelOAuthSession(sessionId).catch(() => undefined)
   }
 }
 
@@ -308,22 +330,39 @@ async function completeWithModelConfirm(
   // When true, a failing runtime check no longer blocks progression — the
   // user is allowed through onboarding regardless. Used by the API-key path,
   // where we intentionally don't validate the key (it blocked too many users).
-  ignoreRuntimeGate = false
+  ignoreRuntimeGate = false,
+  isCurrent: () => boolean = () => true
 ) {
   await ctx.requestGateway('reload.env').catch(() => undefined)
 
+  if (!isCurrent()) {
+    return
+  }
+
   const defaults = await fetchProviderDefaultModel(preferredSlugs)
+
+  if (!isCurrent()) {
+    return
+  }
 
   if (defaults) {
     // Persist the chosen provider/model before the runtime gate so a stale
     // config provider (e.g. anthropic from a prior failed setup) cannot make
     // setup.runtime_check validate the wrong backend after a fresh OAuth login.
     try {
+      if (!isCurrent()) {
+        return
+      }
+
       const res = await setModelAssignment({
         scope: 'main',
         provider: defaults.providerSlug,
         model: defaults.defaultModel
       })
+
+      if (!isCurrent()) {
+        return
+      }
 
       notifyGatewayTools(res.gateway_tools)
     } catch {
@@ -333,6 +372,10 @@ async function completeWithModelConfirm(
   }
 
   const runtime = await checkRuntime(ctx, preferredSlugs[0])
+
+  if (!isCurrent()) {
+    return
+  }
 
   if (!runtime.ready && !ignoreRuntimeGate) {
     onFail(runtime.reason)
@@ -407,7 +450,7 @@ export function requestDesktopOnboardingForCredentialWarning(reason: null | stri
 // duplicating provider UI. Sets manual=true so the overlay shows the picker
 // even though configured===true, and refreshes the provider list.
 export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONBOARDING_REASON) {
-  oauthOperationGeneration += 1
+  invalidateCurrentOAuthFlow()
   patch({
     manual: true,
     requested: true,
@@ -427,7 +470,7 @@ export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONB
 // (`custom` is not an OAuth provider, so the generic manual flow would just
 // re-show the picker — the original "booted back to the first screen" loop).
 export function startManualLocalEndpoint(reason: null | string = null) {
-  oauthOperationGeneration += 1
+  invalidateCurrentOAuthFlow()
   pendingProviderOAuthId = null
   patch({
     manual: true,
@@ -468,7 +511,7 @@ export function clearPendingProviderOAuth() {
 // (working) configuration. Only valid in the manual path — the unconfigured
 // first-run flow has no close affordance because the app can't run yet.
 export function closeManualOnboarding() {
-  oauthOperationGeneration += 1
+  invalidateCurrentOAuthFlow()
   pendingProviderOAuthId = null
 
   patch({ manual: false, requested: false, localEndpoint: false, flow: { status: 'idle' } })
@@ -477,6 +520,7 @@ export function closeManualOnboarding() {
 export function completeDesktopOnboarding() {
   oauthOperationGeneration += 1
   clearPoll()
+  activeOAuthSessionId = null
   writeCachedConfigured(true)
   // A real provider is now connected, so any earlier "choose later" skip is
   // moot — clear it so the flag never lingers in a configured install.
@@ -501,8 +545,7 @@ export function completeDesktopOnboarding() {
 // stops forcing the choice up front. Distinct from completeDesktopOnboarding,
 // which marks the app actually configured.
 export function dismissFirstRunOnboarding() {
-  oauthOperationGeneration += 1
-  clearPoll()
+  invalidateCurrentOAuthFlow()
   writeCachedSkipped(true)
   patch({ firstRunSkipped: true, requested: false, manual: false, localEndpoint: false, flow: { status: 'idle' } })
 }
@@ -572,7 +615,7 @@ async function openSignInUrl(url: string) {
     try {
       await window.hermesDesktop.openExternal(url)
 
-      return
+      return true
     } catch {
       // Bridge present but failed (no OS handler, user denied, etc.). Fall
       // through to window.open so the sign-in URL still opens and the flow
@@ -580,7 +623,7 @@ async function openSignInUrl(url: string) {
     }
   }
 
-  window.open(url, '_blank', 'noopener,noreferrer')
+  return window.open(url, '_blank', 'noopener,noreferrer') !== null
 }
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
@@ -604,13 +647,29 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
       return
     }
 
+    activeOAuthSessionId = start.session_id
+
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
-    await openSignInUrl(browserUrl)
+    const opened = await openSignInUrl(browserUrl)
 
     if (operationGeneration !== oauthOperationGeneration) {
       await cancelOAuthSession(start.session_id).catch(() => undefined)
 
       return
+    }
+
+    if (!opened) {
+      notify({
+        kind: 'warning',
+        title: 'Sign-in window was blocked',
+        message: 'Allow pop-ups, then open the authorization page to continue.',
+        action: {
+          label: 'Open sign-in page',
+          onClick: () => {
+            window.open(browserUrl, '_blank', 'noopener,noreferrer')
+          }
+        }
+      })
     }
 
     if (start.flow === 'pkce') {
@@ -620,7 +679,18 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
     }
 
     setFlow({ status: 'polling', provider, start, copied: false })
-    pollTimer = window.setInterval(() => void pollSession(provider, start, ctx), POLL_MS)
+    pollTimer = window.setInterval(() => {
+      if (pollRequestGeneration === operationGeneration) {
+        return
+      }
+
+      pollRequestGeneration = operationGeneration
+      void pollSession(provider, start, ctx, operationGeneration).finally(() => {
+        if (pollRequestGeneration === operationGeneration) {
+          pollRequestGeneration = null
+        }
+      })
+    }, POLL_MS)
   } catch (error) {
     if (operationGeneration !== oauthOperationGeneration) {
       return
@@ -631,25 +701,47 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 }
 
 // Poll a session-backed device-code flow until it resolves.
-async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: OnboardingContext) {
+async function pollSession(
+  provider: OAuthProvider,
+  start: DeviceStart,
+  ctx: OnboardingContext,
+  operationGeneration: number
+) {
   try {
     const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+      return
+    }
 
     if (status === 'approved') {
       clearPoll()
       setFlow({ status: 'success', provider })
-      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
-        setFlow({
-          status: 'error',
-          provider,
-          message: providerResolutionFailure(reason)
-        })
+      await completeWithModelConfirm(
+        ctx,
+        provider.name,
+        [provider.id],
+        reason => {
+          if (oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+            setFlow({
+              status: 'error',
+              provider,
+              message: providerResolutionFailure(reason)
+            })
+          }
+        },
+        false,
+        () => oauthOperationIsCurrent(operationGeneration, start.session_id)
       )
     } else if (status !== 'pending') {
       clearPoll()
       setFlow({ status: 'error', provider, start, message: error_message || `Sign-in ${status}.` })
     }
   } catch (error) {
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+      return
+    }
+
     clearPoll()
     setFlow({ status: 'error', provider, start, message: `Polling failed: ${errMessage(error)}` })
   }
@@ -671,36 +763,50 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
   }
 
   const { provider, start, code } = flow
+  const operationGeneration = oauthOperationGeneration
+
+  activeOAuthSessionId = start.session_id
   setFlow({ status: 'submitting', provider, start })
 
   try {
     const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
 
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+      return
+    }
+
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
-      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
-        setFlow({
-          status: 'error',
-          provider,
-          message: providerResolutionFailure(reason)
-        })
+      await completeWithModelConfirm(
+        ctx,
+        provider.name,
+        [provider.id],
+        reason => {
+          if (oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+            setFlow({
+              status: 'error',
+              provider,
+              message: providerResolutionFailure(reason)
+            })
+          }
+        },
+        false,
+        () => oauthOperationIsCurrent(operationGeneration, start.session_id)
       )
     } else {
       setFlow({ status: 'error', provider, start, message: resp.message || 'Token exchange failed.' })
     }
   } catch (error) {
+    if (!oauthOperationIsCurrent(operationGeneration, start.session_id)) {
+      return
+    }
+
     setFlow({ status: 'error', provider, start, message: errMessage(error) })
   }
 }
 
 export function cancelOnboardingFlow() {
-  oauthOperationGeneration += 1
-  clearPoll()
-  const sessionId = sessionIdFor($desktopOnboarding.get().flow)
-
-  if (sessionId) {
-    cancelOAuthSession(sessionId).catch(() => undefined)
-  }
+  invalidateCurrentOAuthFlow()
 
   setFlow({ status: 'idle' })
 }

@@ -670,15 +670,31 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       }
 
       const url = start.verification_url
+      let opened = false
 
       if (window.hermesDesktop?.openExternal) {
         try {
           await window.hermesDesktop.openExternal(url)
+          opened = true
         } catch {
-          window.open(url, '_blank', 'noopener,noreferrer')
+          opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
         }
       } else {
-        window.open(url, '_blank', 'noopener,noreferrer')
+        opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
+      }
+
+      if (!opened) {
+        notify({
+          kind: 'warning',
+          title: 'Sign-in window was blocked',
+          message: 'Allow pop-ups, then open the authorization page to continue.',
+          action: {
+            label: 'Open sign-in page',
+            onClick: () => {
+              window.open(url, '_blank', 'noopener,noreferrer')
+            }
+          }
+        })
       }
 
       const pollIntervalMs = Math.max(1000, start.poll_interval * 1000)

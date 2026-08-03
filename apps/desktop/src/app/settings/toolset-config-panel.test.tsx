@@ -1167,7 +1167,7 @@ describe('ToolsetConfigPanel', () => {
 
         expect(pollOAuthSession).toHaveBeenCalled()
         rendered.unmount()
-        resolvePoll?.({ status: 'approved' })
+        resolvePoll?.({ status: 'approved', session_id: 'late-poll-session' })
 
         await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-poll-session'))
         expect(selectToolsetProvider).not.toHaveBeenCalled()
