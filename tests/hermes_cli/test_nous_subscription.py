@@ -207,24 +207,14 @@ def test_stt_codex_oauth_provider_uses_hermes_auth_store(monkeypatch):
     assert features.stt.explicit_configured is True
 
 
-def test_codex_stt_backend_uses_runtime_resolver_without_refresh(monkeypatch):
-    calls = []
-
-    def _resolve(**kwargs):
-        calls.append(kwargs)
-        return {"api_key": "pool-token", "source": "credential_pool"}
-
-    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", _resolve)
+def test_codex_stt_backend_uses_local_credential_probe(monkeypatch):
+    monkeypatch.setattr(auth, "has_codex_runtime_credentials", lambda: True)
 
     assert ns._codex_stt_backend_available() is True
-    assert calls == [{"refresh_if_expiring": False}]
 
 
-def test_codex_stt_backend_is_unavailable_when_runtime_resolver_fails(monkeypatch):
-    def _resolve(**_kwargs):
-        raise RuntimeError("missing")
-
-    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", _resolve)
+def test_codex_stt_backend_is_unavailable_without_credentials(monkeypatch):
+    monkeypatch.setattr(auth, "has_codex_runtime_credentials", lambda: False)
 
     assert ns._codex_stt_backend_available() is False
 

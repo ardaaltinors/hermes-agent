@@ -206,26 +206,73 @@ def _has_openai_audio_backend() -> bool:
         return False
 
 
-def _resolve_codex_stt_credentials(*, force_refresh: bool = False) -> Dict[str, Any]:
-    """Resolve Hermes-owned ChatGPT/Codex OAuth credentials for dictation."""
-    from hermes_cli.auth import AuthError, _read_codex_tokens
-    from hermes_cli.auth import resolve_codex_runtime_credentials
+def _codex_stt_credentials_from_pool_entry(entry: Any) -> Dict[str, Any]:
+    """Convert a selected Codex credential-pool entry to request credentials."""
+    from hermes_cli.auth import codex_account_id_from_access_token
 
-    credentials = resolve_codex_runtime_credentials(
-        force_refresh=force_refresh,
-        refresh_if_expiring=True,
+    token = str(entry.runtime_api_key or "").strip()
+    if not token:
+        raise ValueError("OpenAI Codex OAuth credentials are unavailable.")
+    return {
+        "provider": "openai-codex",
+        "api_key": token,
+        "source": "credential_pool",
+        "credential_id": entry.id,
+        "account_id": codex_account_id_from_access_token(token),
+    }
+
+
+def _resolve_codex_stt_credentials() -> Dict[str, Any]:
+    """Select and proactively refresh a Codex OAuth pool credential."""
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("openai-codex").select()
+    if entry is None:
+        raise ValueError("OpenAI Codex OAuth credentials are unavailable.")
+    return _codex_stt_credentials_from_pool_entry(entry)
+
+
+def _retry_codex_stt_credentials(
+    credentials: Dict[str, Any], status_code: int
+) -> Optional[Dict[str, Any]]:
+    """Refresh or rotate once after a credential-scoped Codex HTTP failure."""
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    credential_id = str(credentials.get("credential_id") or "").strip() or None
+    failed_token = str(credentials.get("api_key") or "").strip()
+
+    if status_code == 401:
+        refreshed = pool.try_refresh_matching(
+            api_key_hint=failed_token or None,
+            credential_id=credential_id,
+        )
+        if refreshed is not None and refreshed.runtime_api_key != failed_token:
+            return _codex_stt_credentials_from_pool_entry(refreshed)
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=status_code,
+        api_key_hint=failed_token or None,
+        credential_id=credential_id,
     )
-    try:
-        token_data = _read_codex_tokens()
-        tokens = token_data.get("tokens") or {}
-        account_id = str(tokens.get("account_id") or "").strip()
-        if account_id:
-            credentials = dict(credentials)
-            credentials["account_id"] = account_id
-    except AuthError:
-        # Pool-only credentials have no singleton account ID; the header is optional.
-        pass
-    return credentials
+    if next_entry is None or next_entry.runtime_api_key == failed_token:
+        return None
+    return _codex_stt_credentials_from_pool_entry(next_entry)
+
+
+def _mark_codex_stt_credentials_failed(
+    credentials: Dict[str, Any], status_code: int
+) -> None:
+    """Persist a terminal retry failure without issuing another request."""
+    from agent.credential_pool import load_pool
+
+    failed_token = str(credentials.get("api_key") or "").strip()
+    credential_id = str(credentials.get("credential_id") or "").strip() or None
+    load_pool("openai-codex").mark_exhausted_and_rotate(
+        status_code=status_code,
+        api_key_hint=failed_token or None,
+        credential_id=credential_id,
+    )
 
 
 def _has_codex_stt_backend() -> bool:
@@ -2100,11 +2147,19 @@ def _transcribe_openai_codex(
         credentials = _resolve_codex_stt_credentials()
         response = _request(credentials)
 
-        # A token can expire between resolution and upload. Force one refresh
-        # and replay with a newly opened file handle; never loop indefinitely.
-        if response.status_code == 401:
-            credentials = _resolve_codex_stt_credentials(force_refresh=True)
-            response = _request(credentials)
+        # Credential-scoped failures get one bounded recovery attempt: refresh
+        # a rejected token when possible, otherwise rotate to another account.
+        if response.status_code in {401, 429}:
+            retry_credentials = _retry_codex_stt_credentials(
+                credentials, response.status_code
+            )
+            if retry_credentials is not None:
+                credentials = retry_credentials
+                response = _request(credentials)
+                if response.status_code in {401, 429}:
+                    _mark_codex_stt_credentials_failed(
+                        credentials, response.status_code
+                    )
 
         if (
             response.status_code == 403
@@ -2117,7 +2172,20 @@ def _transcribe_openai_codex(
             }
 
         response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Codex OAuth transcription returned invalid JSON.",
+            }
+        if not isinstance(payload, dict):
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Codex OAuth transcription returned an invalid response.",
+            }
         transcript = str(payload.get("text") or "").strip()
         if not transcript:
             return {

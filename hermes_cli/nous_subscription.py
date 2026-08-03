@@ -270,12 +270,11 @@ def _local_stt_backend_available() -> bool:
 
 
 def _codex_stt_backend_available() -> bool:
-    """Return whether the runtime resolver can supply Codex OAuth credentials."""
+    """Return whether Hermes has locally stored Codex OAuth credentials."""
     try:
-        from hermes_cli.auth import resolve_codex_runtime_credentials
+        from hermes_cli.auth import has_codex_runtime_credentials
 
-        credentials = resolve_codex_runtime_credentials(refresh_if_expiring=False)
-        return bool(str(credentials.get("api_key") or "").strip())
+        return has_codex_runtime_credentials()
     except Exception:
         return False
 

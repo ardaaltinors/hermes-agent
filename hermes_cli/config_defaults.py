@@ -1507,7 +1507,8 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" | "openai-codex" (ChatGPT OAuth) | "groq" | "openai" | "mistral" | "xai" | "elevenlabs" | "deepinfra"
+        # Built-in and plugin provider names are documented in the voice-mode guide.
+        "provider": "local",
         # Global language hint applied to EVERY provider unless a per-provider
         # language overrides it. Defaults to "en" — Whisper auto-detection
         # frequently misidentifies short/accented clips, which reads as
@@ -1534,7 +1535,6 @@ DEFAULT_CONFIG = {
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai_codex": {
-            "language": "",  # uses the existing Hermes ChatGPT/Codex OAuth login
             "timeout": 120,
         },
         "mistral": {

@@ -3927,6 +3927,18 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def codex_account_id_from_access_token(access_token: str) -> Optional[str]:
+    """Return the ChatGPT account id embedded in a Codex access token."""
+    claims = _decode_jwt_claims(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claims, dict):
+        return None
+    account_id = auth_claims.get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return None
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -4368,6 +4380,23 @@ def _pool_codex_access_token() -> str:
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
+
+
+def has_codex_runtime_credentials() -> bool:
+    """Return whether Hermes has a usable singleton or pooled Codex token.
+
+    This is a local auth-store probe only: it never refreshes tokens or calls
+    the network, so status and picker UIs can use it safely.
+    """
+    try:
+        data = _read_codex_tokens()
+    except AuthError:
+        data = None
+    if isinstance(data, dict):
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict) and str(tokens.get("access_token") or "").strip():
+            return True
+    return bool(_pool_codex_access_token())
 
 
 # =============================================================================

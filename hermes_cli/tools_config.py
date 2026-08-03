@@ -438,6 +438,7 @@ TOOL_CATEGORIES = {
                 "badge": "subscription",
                 "tag": "ChatGPT/Codex dictation via your existing OAuth login",
                 "env_vars": [],
+                "post_setup": "openai_codex",
                 "stt_provider": "openai-codex",
             },
             {
@@ -1946,6 +1947,35 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    Restart Hermes for tracing to take effect.")
         _print_info("    Verify: hermes plugins list")
 
+    elif post_setup_key == "openai_codex":
+        try:
+            from hermes_cli.auth import (
+                PROVIDER_REGISTRY,
+                _login_openai_codex,
+                has_codex_runtime_credentials,
+            )
+        except Exception as exc:
+            _print_warning(f"    Could not load OpenAI Codex auth helpers: {exc}")
+            _print_info("    Run later: hermes auth add openai-codex")
+            return
+
+        if has_codex_runtime_credentials():
+            _print_success("    OpenAI Codex OAuth credentials are already configured")
+            return
+
+        import argparse
+
+        _print_info("    OpenAI Codex OAuth login is required for transcription.")
+        try:
+            _login_openai_codex(
+                argparse.Namespace(), PROVIDER_REGISTRY["openai-codex"]
+            )
+        except SystemExit:
+            _print_warning(
+                "    OpenAI Codex login did not complete. "
+                "Run later: hermes auth add openai-codex"
+            )
+
     elif post_setup_key == "xai_grok":
         # Shared credential bootstrap for any picker entry that talks to xAI
         # (TTS, Video Gen, future Image Gen, etc.). Accepts either a
@@ -3353,6 +3383,15 @@ def provider_readiness_status(
 
     post_setup = provider.get("post_setup")
     if post_setup:
+        if post_setup == "openai_codex":
+            try:
+                from hermes_cli.auth import has_codex_runtime_credentials
+
+                return (
+                    "ready" if has_codex_runtime_credentials() else "needs_auth"
+                )
+            except Exception:
+                return "needs_auth"
         if post_setup == "xai_grok":
             return "ready" if _xai_credentials_present() else "needs_auth"
         predicate = _POST_SETUP_READY.get(post_setup)
@@ -4191,6 +4230,17 @@ def _configure_provider(
             )
             _print_warning(
                 f"  {message or 'Nous Subscription is only available after logging into Nous Portal.'}"
+            )
+            return
+
+    if provider.get("post_setup") == "openai_codex":
+        from hermes_cli.auth import has_codex_runtime_credentials
+
+        if not has_codex_runtime_credentials():
+            _run_post_setup("openai_codex")
+        if not has_codex_runtime_credentials():
+            _print_warning(
+                "  Not enabled — OpenAI Codex OAuth login is required for transcription."
             )
             return
 
