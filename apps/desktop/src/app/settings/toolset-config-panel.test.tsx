@@ -5,7 +5,7 @@ import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { OAuthStartResponse, ToolsetConfig } from '@/types/hermes'
+import type { OAuthPollResponse, OAuthStartResponse, ToolsetConfig } from '@/types/hermes'
 
 // EnvVarField navigates to Settings → Keys via useNavigate, so every render
 // needs a router context. The navigate spy asserts the deep-link target.
@@ -1105,6 +1105,74 @@ describe('ToolsetConfigPanel', () => {
         expect(openSpy).not.toHaveBeenCalled()
         expect(selectToolsetProvider).not.toHaveBeenCalled()
       } finally {
+        openSpy.mockRestore()
+      }
+    })
+
+    it('does not select a provider when an in-flight poll approves after unmount', async () => {
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      startOAuthLogin.mockResolvedValue({
+        flow: 'device_code',
+        session_id: 'late-poll-session',
+        user_code: 'POLL-1234',
+        verification_url: 'https://auth.openai.com/device',
+        poll_interval: 1,
+        expires_in: 900
+      })
+      let resolvePoll: ((value: OAuthPollResponse) => void) | undefined
+
+      pollOAuthSession.mockReturnValue(
+        new Promise<OAuthPollResponse>(resolve => {
+          resolvePoll = resolve
+        })
+      )
+      let timerSpy: ReturnType<typeof vi.spyOn> | undefined
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+      try {
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+        const rendered = render(<ToolsetConfigPanel toolset="stt" />)
+        const selectButton = await screen.findByRole('button', { name: /Use this backend/ })
+
+        timerSpy = vi.spyOn(window, 'setTimeout').mockImplementation(handler => {
+          if (typeof handler === 'function') {
+            window.queueMicrotask(handler)
+          }
+
+          return 1 as never
+        })
+        fireEvent.click(selectButton)
+
+        for (let attempt = 0; attempt < 10 && !pollOAuthSession.mock.calls.length; attempt += 1) {
+          await Promise.resolve()
+        }
+
+        expect(pollOAuthSession).toHaveBeenCalled()
+        rendered.unmount()
+        resolvePoll?.({ status: 'approved' })
+
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('late-poll-session'))
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+      } finally {
+        timerSpy?.mockRestore()
         openSpy.mockRestore()
       }
     })

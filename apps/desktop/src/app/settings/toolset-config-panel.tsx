@@ -591,6 +591,10 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         }
       }
 
+      if (!mountedRef.current) {
+        return
+      }
+
       const result = await selectToolsetProvider(toolset, provider.name)
       // Mirror the backend write locally so dependent UI (model catalog
       // enablement) tracks the new active backend without a refetch.
@@ -690,6 +694,10 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
         const polled = await pollOAuthSession(providerId, start.session_id)
 
+        if (!mountedRef.current) {
+          return false
+        }
+
         if (polled.status === 'approved') {
           activeOAuthSessionRef.current = null
 
@@ -698,6 +706,11 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
           }
 
           await refresh()
+
+          if (!mountedRef.current) {
+            return false
+          }
+
           onConfiguredChange?.()
 
           return true

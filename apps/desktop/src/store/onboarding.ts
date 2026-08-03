@@ -160,6 +160,7 @@ export const $desktopOnboarding = atom<DesktopOnboardingState>(INITIAL)
 
 let pollTimer: number | null = null
 let providersRefreshPromise: null | Promise<void> = null
+let oauthOperationGeneration = 0
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -406,6 +407,7 @@ export function requestDesktopOnboardingForCredentialWarning(reason: null | stri
 // duplicating provider UI. Sets manual=true so the overlay shows the picker
 // even though configured===true, and refreshes the provider list.
 export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONBOARDING_REASON) {
+  oauthOperationGeneration += 1
   patch({
     manual: true,
     requested: true,
@@ -425,6 +427,7 @@ export function startManualOnboarding(reason: null | string = DEFAULT_MANUAL_ONB
 // (`custom` is not an OAuth provider, so the generic manual flow would just
 // re-show the picker — the original "booted back to the first screen" loop).
 export function startManualLocalEndpoint(reason: null | string = null) {
+  oauthOperationGeneration += 1
   pendingProviderOAuthId = null
   patch({
     manual: true,
@@ -465,12 +468,14 @@ export function clearPendingProviderOAuth() {
 // (working) configuration. Only valid in the manual path — the unconfigured
 // first-run flow has no close affordance because the app can't run yet.
 export function closeManualOnboarding() {
+  oauthOperationGeneration += 1
   pendingProviderOAuthId = null
 
   patch({ manual: false, requested: false, localEndpoint: false, flow: { status: 'idle' } })
 }
 
 export function completeDesktopOnboarding() {
+  oauthOperationGeneration += 1
   clearPoll()
   writeCachedConfigured(true)
   // A real provider is now connected, so any earlier "choose later" skip is
@@ -496,6 +501,7 @@ export function completeDesktopOnboarding() {
 // stops forcing the choice up front. Distinct from completeDesktopOnboarding,
 // which marks the app actually configured.
 export function dismissFirstRunOnboarding() {
+  oauthOperationGeneration += 1
   clearPoll()
   writeCachedSkipped(true)
   patch({ firstRunSkipped: true, requested: false, manual: false, localEndpoint: false, flow: { status: 'idle' } })
@@ -579,6 +585,7 @@ async function openSignInUrl(url: string) {
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
   clearPoll()
+  const operationGeneration = ++oauthOperationGeneration
 
   if (provider.flow === 'external') {
     setFlow({ status: 'external_pending', provider, copied: false })
@@ -590,8 +597,21 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 
   try {
     const start = await startOAuthLogin(provider.id)
+
+    if (operationGeneration !== oauthOperationGeneration) {
+      await cancelOAuthSession(start.session_id).catch(() => undefined)
+
+      return
+    }
+
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
     await openSignInUrl(browserUrl)
+
+    if (operationGeneration !== oauthOperationGeneration) {
+      await cancelOAuthSession(start.session_id).catch(() => undefined)
+
+      return
+    }
 
     if (start.flow === 'pkce') {
       setFlow({ status: 'awaiting_user', provider, start, code: '' })
@@ -602,6 +622,10 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
     setFlow({ status: 'polling', provider, start, copied: false })
     pollTimer = window.setInterval(() => void pollSession(provider, start, ctx), POLL_MS)
   } catch (error) {
+    if (operationGeneration !== oauthOperationGeneration) {
+      return
+    }
+
     setFlow({ status: 'error', provider, message: `Could not start sign-in: ${errMessage(error)}` })
   }
 }
@@ -670,6 +694,7 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
 }
 
 export function cancelOnboardingFlow() {
+  oauthOperationGeneration += 1
   clearPoll()
   const sessionId = sessionIdFor($desktopOnboarding.get().flow)
 

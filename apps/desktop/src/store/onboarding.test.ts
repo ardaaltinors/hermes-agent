@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import * as notifications from '@/store/notifications'
-import type { OAuthProvider } from '@/types/hermes'
+import type { OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
 import {
   $desktopOnboarding,
+  cancelOnboardingFlow,
   type DesktopOnboardingState,
   type OnboardingContext,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
+  startProviderOAuth,
   submitOnboardingCode
 } from './onboarding'
 
@@ -98,6 +100,52 @@ describe('refreshOnboarding', () => {
     window.localStorage.clear()
     $desktopOnboarding.set(baseState())
     vi.restoreAllMocks()
+  })
+
+  it('cancels a stale OAuth start that resolves after onboarding is dismissed', async () => {
+    let resolveStart: ((value: OAuthStartResponse) => void) | undefined
+
+    const startPromise = new Promise<OAuthStartResponse>(resolve => {
+      resolveStart = resolve
+    })
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return startPromise
+      }
+
+      if (path.includes('/sessions/stale-onboarding-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    installApiMock(api)
+    const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+    expect($desktopOnboarding.get().flow.status).toBe('starting')
+    cancelOnboardingFlow()
+    resolveStart?.({
+      flow: 'device_code',
+      session_id: 'stale-onboarding-session',
+      user_code: 'STALE-1234',
+      verification_url: 'https://auth.openai.com/device',
+      expires_in: 900,
+      poll_interval: 5
+    })
+    await operation
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/providers/oauth/sessions/stale-onboarding-session',
+        method: 'DELETE'
+      })
+    )
+    expect(openSpy).not.toHaveBeenCalled()
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
   })
 
   it('refreshes OAuth providers again when onboarding was explicitly requested', async () => {
