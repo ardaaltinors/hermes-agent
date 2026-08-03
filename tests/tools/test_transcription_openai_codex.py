@@ -164,7 +164,7 @@ def test_codex_retry_rotates_pool_credential_after_rate_limit():
 
     next_entry = SimpleNamespace(runtime_api_key="next-token", id="cred-2")
     pool = Mock()
-    pool.select.return_value = next_entry
+    pool.select_excluding.return_value = next_entry
     with (
         patch("agent.credential_pool.load_pool", return_value=pool),
         patch(
@@ -178,8 +178,61 @@ def test_codex_retry_rotates_pool_credential_after_rate_limit():
 
     assert credentials is not None
     assert credentials["api_key"] == "next-token"
-    pool.select.assert_called_once_with()
+    pool.select_excluding.assert_called_once_with(
+        credential_id="cred-1", api_key_hint="limited-token"
+    )
     pool.mark_exhausted_and_rotate.assert_not_called()
+
+
+def test_codex_rate_limit_uses_real_fill_first_pool_alternative():
+    from agent.credential_pool import CredentialPool, PooledCredential
+    from tools.transcription_tools import _retry_codex_stt_credentials
+
+    pool = CredentialPool(
+        "openai-codex",
+        [
+            PooledCredential(
+                provider="openai-codex",
+                id="a",
+                label="first",
+                auth_type="api_key",
+                priority=0,
+                source="manual:first",
+                access_token="token-a",
+            ),
+            PooledCredential(
+                provider="openai-codex",
+                id="b",
+                label="second",
+                auth_type="api_key",
+                priority=1,
+                source="manual:second",
+                access_token="token-b",
+            ),
+        ],
+    )
+    first = pool.select()
+    assert first is not None
+    assert first.id == "a"
+
+    with (
+        patch("agent.credential_pool.load_pool", return_value=pool),
+        patch(
+            "hermes_cli.auth.codex_account_id_from_access_token",
+            return_value=None,
+        ),
+    ):
+        retry = _retry_codex_stt_credentials(
+            {"api_key": "token-a", "credential_id": "a"}, 429
+        )
+
+    assert retry is not None
+    assert retry["credential_id"] == "b"
+    assert retry["api_key"] == "token-b"
+    assert [(entry.id, entry.last_status) for entry in pool.entries()] == [
+        ("a", None),
+        ("b", None),
+    ]
 
 
 def test_openai_codex_transcription_rotates_once_after_rate_limit(tmp_path):

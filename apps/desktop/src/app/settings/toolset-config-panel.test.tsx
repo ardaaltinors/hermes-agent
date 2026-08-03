@@ -39,6 +39,7 @@ const runToolsetPostSetup = vi.fn()
 const getActionStatus = vi.fn()
 const startOAuthLogin = vi.fn()
 const pollOAuthSession = vi.fn()
+const cancelOAuthSession = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const getHermesConfigSchema = vi.fn()
 const saveHermesConfig = vi.fn()
@@ -59,6 +60,7 @@ vi.mock('@/hermes', () => ({
   getActionStatus: (name: string, lines?: number) => getActionStatus(name, lines),
   startOAuthLogin: (providerId: string, activateProvider?: boolean) => startOAuthLogin(providerId, activateProvider),
   pollOAuthSession: (providerId: string, sessionId: string) => pollOAuthSession(providerId, sessionId),
+  cancelOAuthSession: (sessionId: string) => cancelOAuthSession(sessionId),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   getHermesConfigSchema: () => getHermesConfigSchema(),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config),
@@ -145,6 +147,7 @@ beforeEach(() => {
   getHermesConfigSchema.mockResolvedValue({ fields: {}, category_order: [] })
   saveHermesConfig.mockResolvedValue({ ok: true })
   getElevenLabsVoices.mockResolvedValue({ available: false, voices: [] })
+  cancelOAuthSession.mockResolvedValue({ ok: true })
 })
 
 afterEach(() => {
@@ -1007,6 +1010,51 @@ describe('ToolsetConfigPanel', () => {
         openSpy.mockRestore()
       }
     }, 20000)
+
+    it('cancels an unfinished OAuth session when the panel unmounts', async () => {
+      getToolsetConfig.mockResolvedValue(
+        config({
+          name: 'stt',
+          active_provider: null,
+          providers: [
+            {
+              name: 'OpenAI Codex OAuth',
+              badge: 'subscription',
+              tag: 'ChatGPT/Codex dictation',
+              env_vars: [],
+              post_setup: null,
+              auth_provider: 'openai-codex',
+              requires_nous_auth: false,
+              is_active: false,
+              status: 'needs_auth'
+            }
+          ]
+        })
+      )
+      startOAuthLogin.mockResolvedValue({
+        flow: 'device_code',
+        session_id: 'abandoned-codex-session',
+        user_code: 'CODEX-5678',
+        verification_url: 'https://auth.openai.com/device',
+        poll_interval: 5,
+        expires_in: 900
+      })
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+      try {
+        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+        const rendered = render(<ToolsetConfigPanel toolset="stt" />)
+
+        fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+        await waitFor(() => expect(startOAuthLogin).toHaveBeenCalled())
+        rendered.unmount()
+
+        await waitFor(() => expect(cancelOAuthSession).toHaveBeenCalledWith('abandoned-codex-session'))
+        expect(selectToolsetProvider).not.toHaveBeenCalled()
+      } finally {
+        openSpy.mockRestore()
+      }
+    })
   })
 
   describe('API key deep link', () => {

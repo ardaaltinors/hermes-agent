@@ -5,6 +5,7 @@ import { SETTINGS_ROUTE } from '@/app/routes'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
+  cancelOAuthSession,
   deleteEnvVar,
   getActionStatus,
   getToolsetConfig,
@@ -500,8 +501,9 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // Default-provider selection and a user click race just after config arrives:
   // a stale initialization effect must never replace an explicit choice.
   const providerChoiceClaimedRef = useRef(false)
-  // Guard the Nous Portal sign-in poll loop against unmount/state updates.
+  // Guard the OAuth sign-in poll loop against unmount/state updates.
   const mountedRef = useRef(true)
+  const activeOAuthSessionRef = useRef<string | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- mount flag guarding an async poll loop, not an atom mirror
   useEffect(() => {
@@ -509,6 +511,13 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
     return () => {
       mountedRef.current = false
+      const sessionId = activeOAuthSessionRef.current
+
+      activeOAuthSessionRef.current = null
+
+      if (sessionId) {
+        void cancelOAuthSession(sessionId)
+      }
     }
   }, [])
 
@@ -632,6 +641,8 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         return false
       }
 
+      activeOAuthSessionRef.current = start.session_id
+
       if (providerId === 'openai-codex' && start.user_code) {
         const authorizationCode = start.user_code
 
@@ -660,9 +671,12 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         window.open(url, '_blank', 'noopener,noreferrer')
       }
 
-      // Poll until the device-code session resolves (~5s cadence, bounded).
-      for (let attempt = 0; attempt < 120 && mountedRef.current; attempt += 1) {
-        await new Promise(resolve => window.setTimeout(resolve, 5000))
+      const pollIntervalMs = Math.max(1000, start.poll_interval * 1000)
+      const deadline = Date.now() + start.expires_in * 1000
+
+      // Poll until the server-advertised device-code lifetime expires.
+      while (mountedRef.current && Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, pollIntervalMs))
 
         if (!mountedRef.current) {
           return false
@@ -671,6 +685,8 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         const polled = await pollOAuthSession(providerId, start.session_id)
 
         if (polled.status === 'approved') {
+          activeOAuthSessionRef.current = null
+
           if (providerId === 'nous') {
             notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
           }
@@ -682,12 +698,26 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         }
 
         if (polled.status !== 'pending') {
+          activeOAuthSessionRef.current = null
           notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.failedSelect(providerId))
 
           return false
         }
       }
+
+      if (activeOAuthSessionRef.current === start.session_id) {
+        activeOAuthSessionRef.current = null
+        await cancelOAuthSession(start.session_id)
+      }
     } catch (err) {
+      const sessionId = activeOAuthSessionRef.current
+
+      activeOAuthSessionRef.current = null
+
+      if (sessionId) {
+        await cancelOAuthSession(sessionId).catch(() => undefined)
+      }
+
       if (mountedRef.current) {
         notifyError(err, copy.failedSelect(providerId))
       }

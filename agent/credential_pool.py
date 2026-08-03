@@ -1703,6 +1703,35 @@ class CredentialPool:
                 self._unmatched_rotation_streak = 0
         return entry
 
+    def select_excluding(
+        self,
+        *,
+        credential_id: Optional[str] = None,
+        api_key_hint: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """Select an available alternative without exhausting pool entries."""
+
+        def _select_alternative() -> Tuple[Optional[PooledCredential], List[tuple]]:
+            with self._lock:
+                available, pending = self._available_entries(
+                    clear_expired=True,
+                    refresh=True,
+                )
+                alternatives = [
+                    entry
+                    for entry in available
+                    if (not credential_id or entry.id != credential_id)
+                    and (not api_key_hint or entry.runtime_api_key != api_key_hint)
+                ]
+                return (alternatives[0] if alternatives else None), pending
+
+        entry, pending_refresh = _select_alternative()
+        if pending_refresh:
+            self._refresh_pending_entries(pending_refresh)
+        if entry is None and pending_refresh:
+            entry, _ = _select_alternative()
+        return entry
+
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:

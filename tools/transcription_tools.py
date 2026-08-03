@@ -258,7 +258,10 @@ def _retry_codex_stt_credentials(
         # A transcribe-endpoint 429 may be feature-local rather than an
         # account-wide Codex quota. Rotate for this bounded request only; do
         # not persist shared inference-pool exhaustion.
-        next_entry = pool.select()
+        next_entry = pool.select_excluding(
+            credential_id=credential_id,
+            api_key_hint=failed_token or None,
+        )
     if next_entry is None or next_entry.runtime_api_key == failed_token:
         return None
     return _codex_stt_credentials_from_pool_entry(next_entry)

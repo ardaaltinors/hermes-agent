@@ -10787,21 +10787,15 @@ def _codex_full_login_worker(session_id: str) -> None:
     try:
         import httpx
         from hermes_cli.auth import (
-            CODEX_OAUTH_CLIENT_ID,
-            CODEX_OAUTH_TOKEN_URL,
+            _exchange_codex_device_tokens,
+            _request_codex_device_code,
         )
         issuer = "https://auth.openai.com"
 
         # Step 1: request device code
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": CODEX_OAUTH_CLIENT_ID},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code != 200:
-            raise RuntimeError(_codex_device_code_start_error(resp))
-        device_data = resp.json()
+        device_data = _request_codex_device_code(
+            error_formatter=_codex_device_code_start_error
+        )
         user_code = device_data.get("user_code", "")
         device_auth_id = device_data.get("device_auth_id", "")
         poll_interval = max(3, int(device_data.get("interval", "5")))
@@ -10862,21 +10856,7 @@ def _codex_full_login_worker(session_id: str) -> None:
         code_verifier = code_resp.get("code_verifier", "")
         if not authorization_code or not code_verifier:
             raise RuntimeError("device-auth response missing authorization_code/code_verifier")
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            token_resp = client.post(
-                CODEX_OAUTH_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": f"{issuer}/deviceauth/callback",
-                    "client_id": CODEX_OAUTH_CLIENT_ID,
-                    "code_verifier": code_verifier,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        if token_resp.status_code != 200:
-            raise RuntimeError(f"token exchange returned {token_resp.status_code}")
-        tokens = token_resp.json()
+        tokens = _exchange_codex_device_tokens(authorization_code, code_verifier)
         access_token = tokens.get("access_token", "")
         refresh_token = tokens.get("refresh_token", "")
         if not access_token:
