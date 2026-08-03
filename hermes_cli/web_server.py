@@ -10350,6 +10350,8 @@ async def _start_device_code_flow(
         }
 
     if provider_id == "openai-codex":
+        from hermes_cli.auth import CODEX_DEVICE_CODE_START_MAX_WAIT_SECONDS
+
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
         sid, sess = _new_oauth_session("openai-codex", "device_code", profile=profile)
         sess["activate_provider"] = activate_provider
@@ -10362,8 +10364,11 @@ async def _start_device_code_flow(
             target=_codex_full_login_worker, args=(sid,), daemon=True,
             name=f"oauth-codex-{sid[:6]}",
         ).start()
-        # Block briefly until the worker has populated the user_code, OR error.
-        deadline = time.monotonic() + 10
+        # Wait through the bounded device-code request/retry window until the
+        # worker has populated the user_code, or surfaced an error.
+        deadline = (
+            time.monotonic() + CODEX_DEVICE_CODE_START_MAX_WAIT_SECONDS
+        )
         while time.monotonic() < deadline:
             with _oauth_sessions_lock:
                 s = _oauth_sessions.get(sid)

@@ -826,6 +826,9 @@ def _normalize_lmstudio_runtime_base_url(base_url: str) -> str:
 # Such failures are transient and re-authenticating cannot resolve them, so
 # they must be kept distinct from missing/expired-credential errors.
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+# Four 15-second request attempts plus three capped 60-second Retry-After
+# delays, with a small scheduling margin for the dashboard worker.
+CODEX_DEVICE_CODE_START_MAX_WAIT_SECONDS = 245
 
 
 class AuthError(RuntimeError):

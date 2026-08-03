@@ -23,7 +23,8 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
@@ -196,6 +197,47 @@ def test_codex_dashboard_start_forwards_credential_only_intent(monkeypatch):
         "profile": None,
         "activate_provider": False,
     }
+
+
+def test_codex_dashboard_start_waits_through_shared_retry_window(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    clock = iter((0.0, 11.0, 11.0))
+
+    async def fake_sleep(_seconds):
+        with ws._oauth_sessions_lock:
+            session = next(
+                value
+                for value in ws._oauth_sessions.values()
+                if value.get("provider") == "openai-codex"
+            )
+            session.update(
+                user_code="LATE-429",
+                verification_url="https://auth.openai.com/codex/device",
+                expires_in=900,
+                interval=5,
+            )
+
+    monkeypatch.setattr(ws.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        ws,
+        "time",
+        SimpleNamespace(time=time.time, monotonic=lambda: next(clock)),
+    )
+    monkeypatch.setattr(ws.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(ws._start_device_code_flow("openai-codex"))
+    try:
+        assert result["user_code"] == "LATE-429"
+    finally:
+        ws._oauth_sessions.pop(result["session_id"], None)
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
