@@ -29,6 +29,7 @@ Key capabilities:
 - **Built-in stealth** — random fingerprints, CAPTCHA solving, residential proxies (Browserbase)
 - **Session isolation** — each task gets its own browser session
 - **Automatic cleanup** — inactive sessions are closed after a timeout
+- **Constrained file uploads** — upload to visible or hidden file inputs from explicitly allowed directories
 - **Vision analysis** — screenshot + AI analysis for visual understanding
 
 ## Setup
@@ -460,6 +461,42 @@ Type text into an input field. Clears the field first, then types the new text.
 ```
 Type "hermes agent" into the search field @e3
 ```
+
+### `browser_upload`
+
+Upload one or more local files to a visible or hidden `<input type="file">` in
+the current browser session. The target can be a snapshot ref such as `@e3` or a
+CSS selector such as `input[type=file]`.
+
+Uploads are disabled by default. Allow only the staging directories the agent
+needs:
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  upload_allowed_roots:
+    - /absolute/path/to/upload-staging
+```
+
+Restart the Hermes session after changing this setting. The tool is not exposed
+to the model unless at least one configured root exists. Each file is resolved
+before the containment check, so `..` traversal and symlinks that escape an
+allowed root are rejected. Missing files, directories, and paths outside the
+configured roots are also rejected before the browser subprocess runs.
+
+```
+browser_upload(
+  selector="input[type=file]",
+  files=["/absolute/path/to/upload-staging/document.pdf"]
+)
+```
+
+Local Chrome and loopback CDP connections are supported. Cloud browser backends,
+remote CDP endpoints, Camofox, and the Lightpanda engine fail closed: the
+agent-browser command passes file paths to the Chrome process and does not
+transfer local file bytes to a remote browser host. Upload is treated as a
+state-changing action and is blocked by the same private/internal-page guard as
+click, type, and key press.
 
 ### `browser_scroll`
 

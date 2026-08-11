@@ -2041,6 +2041,27 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_upload",
+        "description": "Upload one or more local files to a file input in the current browser session. The selector may be a snapshot ref (for example '@e3') or a CSS selector for a hidden input. Every file must resolve inside a directory configured in browser.upload_allowed_roots. Requires browser_navigate first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "A snapshot ref or CSS selector for the file input (for example '@e3' or 'input[type=file]')"
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "description": "Local file paths. Each resolved file must be inside browser.upload_allowed_roots."
+                }
+            },
+            "required": ["selector", "files"]
+        }
+    },
+    {
         "name": "browser_scroll",
         "description": "Scroll the page in a direction. Use this to reveal more content that may be below or above the current viewport. Requires browser_navigate to be called first.",
         "parameters": {
@@ -3364,6 +3385,171 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         response = _copy_fallback_warning(response, result)
         response = redact_browser_typed_text_for_display(response, text)
         return json.dumps(response, ensure_ascii=False)
+
+
+def _get_upload_allowed_roots() -> List[Path]:
+    """Return configured directories from which browser uploads are allowed."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        raw_roots = (
+            browser_cfg.get("upload_allowed_roots", [])
+            if isinstance(browser_cfg, dict)
+            else []
+        )
+    except Exception as exc:
+        logger.debug("Could not read browser.upload_allowed_roots from config: %s", exc)
+        return []
+
+    if isinstance(raw_roots, str):
+        raw_roots = [raw_roots]
+    if not isinstance(raw_roots, (list, tuple)):
+        return []
+
+    roots: List[Path] = []
+    for raw_root in raw_roots:
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            continue
+        try:
+            root = Path(raw_root).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _browser_upload_backend_error() -> Optional[str]:
+    """Return why the active backend cannot safely consume local upload paths."""
+    if _is_camofox_mode():
+        return "Browser upload is not supported by the Camofox backend."
+
+    if _get_browser_engine() == "lightpanda" and _is_local_mode():
+        return "Browser upload is not supported by the Lightpanda engine; use Chrome."
+
+    cdp_override = _get_cdp_override_raw()
+    if cdp_override:
+        # agent-browser implements upload with DOM.setFileInputFiles, whose
+        # paths are resolved by the Chrome process. Only loopback CDP can be
+        # assumed to share this host filesystem; remote CDP needs a provider-
+        # specific file-transfer API and must fail closed here.
+        from urllib.parse import urlparse
+        import ipaddress
+
+        parsed = urlparse(
+            cdp_override if "://" in cdp_override else f"http://{cdp_override}"
+        )
+        host = (parsed.hostname or "").lower()
+        is_loopback = host == "localhost"
+        if host and not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                pass
+        if not is_loopback:
+            return (
+                "Browser upload is not supported for remote CDP endpoints; "
+                "use local Chrome or a loopback CDP connection."
+            )
+    elif _get_cloud_provider() is not None:
+        return (
+            "Browser upload is not supported by cloud browser backends because "
+            "local files are not transferred to the remote browser host."
+        )
+
+    return None
+
+
+def _resolve_upload_files(files: List[str]) -> Tuple[Optional[List[Path]], Optional[str]]:
+    """Resolve and validate upload paths against the configured root set."""
+    roots = [root for root in _get_upload_allowed_roots() if root.is_dir()]
+    if not roots:
+        return None, (
+            "Browser upload is disabled. Configure browser.upload_allowed_roots "
+            "with at least one existing directory."
+        )
+
+    if not isinstance(files, list) or not files:
+        return None, "At least one upload file is required."
+    if len(files) > 10:
+        return None, "Browser upload accepts at most 10 files per call."
+
+    resolved_files: List[Path] = []
+    for index, raw_file in enumerate(files, start=1):
+        if not isinstance(raw_file, str) or not raw_file.strip():
+            return None, f"Upload file #{index} must be a non-empty path."
+        try:
+            resolved = Path(raw_file).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None, f"Upload file #{index} does not exist or cannot be resolved."
+        if not resolved.is_file():
+            return None, f"Upload file #{index} is not a regular file."
+        if not any(_path_is_within(resolved, root) for root in roots):
+            return None, f"Upload file #{index} is outside browser.upload_allowed_roots."
+        resolved_files.append(resolved)
+
+    return resolved_files, None
+
+
+def browser_upload(
+    selector: str,
+    files: List[str],
+    task_id: Optional[str] = None,
+) -> str:
+    """Upload allowed local files to a file input in the active browser session."""
+    backend_error = _browser_upload_backend_error()
+    if backend_error is not None:
+        return json.dumps({
+            "success": False,
+            "error": backend_error,
+        }, ensure_ascii=False)
+
+    if (
+        not isinstance(selector, str)
+        or not selector.strip()
+        or "\0" in selector
+    ):
+        return json.dumps({
+            "success": False,
+            "error": "A valid, non-empty file input selector is required.",
+        }, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _blocked_private_page_action(effective_task_id, "upload files")
+    if blocked is not None:
+        return blocked
+
+    resolved_files, validation_error = _resolve_upload_files(files)
+    if validation_error is not None or resolved_files is None:
+        return json.dumps({"success": False, "error": validation_error}, ensure_ascii=False)
+
+    result = _run_browser_command(
+        effective_task_id,
+        "upload",
+        [selector, *(str(path) for path in resolved_files)],
+    )
+    if not result.get("success"):
+        error = str(result.get("error", "Failed to upload files"))
+        for path in resolved_files:
+            error = error.replace(str(path), path.name)
+        return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+    response = {
+        "success": True,
+        "element": selector,
+        "uploaded": [path.name for path in resolved_files],
+    }
+    return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
 def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
@@ -4933,6 +5119,24 @@ def check_browser_requirements() -> bool:
     return True
 
 
+def check_browser_upload_requirements() -> bool:
+    """Advertise uploads only for supported browsers with an allowed root."""
+    if _browser_upload_backend_error() is not None:
+        return False
+    if not any(root.is_dir() for root in _get_upload_allowed_roots()):
+        return False
+    # Unlike browser_cdp, upload always delegates to the agent-browser CLI.
+    # A configured CDP override makes the base browser check succeed without
+    # probing for that CLI, so enforce this upload-specific requirement here.
+    try:
+        browser_cmd = _find_agent_browser(validate=False)
+    except FileNotFoundError:
+        return False
+    if _requires_real_termux_browser_install(browser_cmd):
+        return False
+    return check_browser_requirements()
+
+
 def check_browser_vision_requirements() -> bool:
     """Whether ``browser_vision`` should be advertised to the model.
 
@@ -5046,6 +5250,18 @@ registry.register(
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+)
+registry.register(
+    name="browser_upload",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_upload"],
+    handler=lambda args, **kw: browser_upload(
+        selector=args.get("selector", ""),
+        files=args.get("files", []),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_upload_requirements,
+    emoji="📤",
 )
 registry.register(
     name="browser_scroll",

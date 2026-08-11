@@ -371,6 +371,10 @@ DEFAULT_CONFIG = {
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
+        # browser_upload is hidden until at least one existing directory is
+        # configured here. Upload paths are resolved before containment checks,
+        # so traversal and symlink escapes are rejected.
+        "upload_allowed_roots": [],
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "headed": False,  # Local mode: launch Chromium with a visible window (also skips per-turn cleanup so the window persists between turns; idle reaper still applies)
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)

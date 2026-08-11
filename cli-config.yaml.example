@@ -385,6 +385,11 @@ browser:
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
 
+  # File uploads are disabled unless one or more existing directories are
+  # explicitly allowed. Paths are resolved before containment checks, blocking
+  # ../ traversal and symlink escapes outside these roots.
+  upload_allowed_roots: []
+
 # =============================================================================
 # Tool Loop Guardrails
 # =============================================================================
